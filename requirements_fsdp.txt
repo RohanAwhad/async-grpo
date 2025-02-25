@@ -1,0 +1,19 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch #==2.5.1
+torchvision
+transformers #==4.48.3
+datasets
+accelerate #==1.3
+ray[default]==2.42.1
+tenacity
+ipython
+nest_asyncio
+numba
+rich
+flash-attn #==v2.7.2.post1
+msgspec
+cloudpickle
+pyzmq
+blake3
+py-cpuinfo
+openai

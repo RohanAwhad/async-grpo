@@ -1,0 +1,4 @@
+--extra-index-url https://wheels.vllm.ai/nightly  # No --pre needed
+vllm
+math-verify[antlr4_13_2]
+ray[default]==2.42.1
