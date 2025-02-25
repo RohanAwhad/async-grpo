@@ -1,7 +1,9 @@
 import argparse
 from copy import deepcopy
+from functools import partial
 from hashlib import sha256
 import random
+import logging
 import time
 import ray
 from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
@@ -13,7 +15,31 @@ import atexit
 from vllm_registry import get_or_create_registry  # helper function from registry
 import asyncio
 from math_verify import parse, verify
+from math_verify.parser import LatexExtractionConfig, NormalizationConfig
 import re
+
+import numpy as np
+from numba import njit
+logging.getLogger('numba').setLevel(logging.WARNING)
+
+@njit
+def normalize_rewards(rewards):
+    """
+    Normalize rewards within each group to compute advantages.
+
+    Parameters:
+        rewards : np.ndarray (1D)
+            Array of rewards for each sample of shape (n_samples,).
+
+    Returns:
+        np.ndarray (1D)
+            Normalized rewards of shape (n_samples,).
+    """
+    mean = np.mean(rewards)
+    std = np.std(rewards) + 1e-4
+    return (rewards - mean) / std
+
+
 
 class BaseVLLMWorker:
     """
@@ -139,28 +165,34 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             sample['sample_text'] = self.tokenizer.decode(sample['sample_ids'])
             sample['sample_position_ids'] = list(range(len(sample['sample_ids'])))
             sample['reward'] = await self.verify_worker.verify.remote(sample)
-
+        
+        group_rewards = np.array([s['reward'] for s in samples])
+        group_advantages = normalize_rewards(group_rewards)
+        for sample_, advantage in zip(samples, group_advantages):
+            sample_['advantage'] = advantage.item()
+        
         return samples
+
+parsing_func = partial(parse, extraction_config=[
+    LatexExtractionConfig(
+        boxed_match_priority=0, 
+        normalization_config=NormalizationConfig(
+            boxed="last"
+        )
+    )
+])
 
 @ray.remote
 class VerifierWorker:
     def verify(self, sample: dict) -> float:
         try:
             return float(verify(
-                parse(sample['gt_answer']),
-                parse(sample['sample_text'])
+                parsing_func(r'\boxed{'+sample['gt_answer']+'}'),
+                parsing_func(sample['sample_text']),
             ))
         except Exception as e:
             print(f"Error during verification: {e}")
             return 0
-        
-def extract_boxed(text: str) -> str:
-    """
-    Extracts the content inside the last occurrence of '\\boxed{...}' in the given text.
-    Returns the extracted string if found, or None otherwise.
-    """
-    matches = re.findall(r'\\boxed\{(.*?)\}', text, flags=re.DOTALL)
-    return matches[-1] if matches else None
 
 if __name__ == "__main__":
     ray.init(address="auto", namespace="test")
