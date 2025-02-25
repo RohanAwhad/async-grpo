@@ -61,6 +61,7 @@ the hyperparameters to be tuned are in `trainer_core.py`.
 - when a ray worker fails, the driver (the process that spawns such worker) shows unrelated errors. It's usually a module not found error in the child worker.
 - when things fail, do ray stop everywhere and restart the process on all nodes. Ray becomes a bit unstable when restarting processes.
 - It's important to create a separate conda environment for the training process or the worker environments will become corrupted. The python version should be the same as the base environment.
+- `ray list actors | grep ALIVE` can be used to check if all the expected workers are running.
 
 ### Architecture Explanation
 
@@ -70,7 +71,7 @@ We use Ray to create a distributed system composed of workers with different rol
 
 #### Sample Data Structure
 
-The unit data structure is the concept of a `sample`. It is a dictionary that should contain `input_token_ids` (the [sample dataset](math_simplerl_qwen_data_token_ids.jsonl) contains it). Thus, every worker processes one unit of data.
+The unit data structure is the concept of a `sample`. It is a dictionary that should contain `input_token_ids` (the [sample dataset](math_simplerl_qwen_data_token_ids.jsonl) contains it). Thus, every worker processes one unit of data at a time but asynchronously.
 
 #### Inference Worker Registration
 
