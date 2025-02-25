@@ -359,7 +359,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/new_data/experiments_rh/simple_r1_replica_v0",
+        default="/new_data/experiments_rh/simple_r1_replica_v2",
         help="Output directory where model checkpoints and configuration files will be saved."
     )
 

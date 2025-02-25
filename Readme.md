@@ -17,6 +17,16 @@ start with the head node
 conda activate base
 ray start --head --port 6379
 ```
+```bash
+ray start --head \
+  --num-cpus=0 \                  # Disable task scheduling on head
+  --resources='{"verification_slot":1000}' \
+  --port=6379 \                   # Default GCS port
+  --object-manager-port=8076 \    # Required for large object transfers
+  --min-worker-port=10000 \       # Avoid port conflicts
+  --max-worker-port=20000 \
+  --temp-dir=/dev/shm
+```
 
 worker node/s
 ```bash

@@ -17,6 +17,7 @@ import asyncio
 from math_verify import parse, verify
 from math_verify.parser import LatexExtractionConfig, NormalizationConfig
 import re
+from verifier_registry import get_or_create_verifier_registry, verify_distributed  # new helper for verifiers
 
 import numpy as np
 from numba import njit
@@ -38,8 +39,6 @@ def normalize_rewards(rewards):
     mean = np.mean(rewards)
     std = np.std(rewards) + 1e-4
     return (rewards - mean) / std
-
-
 
 class BaseVLLMWorker:
     """
@@ -118,13 +117,11 @@ class BaseVLLMWorker:
 
 @ray.remote
 class GenerationVLLMWorker(BaseVLLMWorker):
-    def __init__(self, *args, **kwargs):
-        # Pass model_path, worker_id, tensor_parallel_size, max_num_seqs to Base
-        super().__init__(*args, **kwargs)
-        self.verify_worker = VerifierWorker.options(
-            name=f"verifier_worker_{str(uuid.uuid4())}",
-            num_cpus=4,
-        ).remote()
+    def __init__(self, model_path: str, worker_id: str, tensor_parallel_size: int, max_num_seqs: int, num_verifiers: int = 4):
+        # Pass the common parameters to the base initializer.
+        super().__init__(model_path, worker_id, tensor_parallel_size, max_num_seqs)
+        # Use the passed num_verifiers to get/create the verifier registry.
+        # self.verifier_registry = get_or_create_verifier_registry("verifier_registry", num_verifiers=num_verifiers)
         self.registry = get_or_create_registry("generation_vllm_registry")
         self.setup_registration()
     
@@ -140,6 +137,12 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             max_num_seqs=max_num_seqs,
             max_model_len=config.max_position_embeddings,
         )
+    
+    async def robust_verify(self, sample: dict) -> float:
+        try:
+            return await asyncio.wait_for(verify_distributed.remote(sample), timeout=120)
+        except asyncio.TimeoutError:
+            return 0
     
     async def inference(self, sample: dict, max_new_tokens: int = None, **kwargs) -> list[dict]:
         # For generation, parameters are flexible.
@@ -158,18 +161,22 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             sample['input_len'] = len(sample['input_token_ids'])
         
         samples = [deepcopy(sample) for _ in range(len(request_out.outputs))]
+        
+        reward_tasks = []
         for sample, out in zip(samples, request_out.outputs):
             sample['output_token_ids'] = list(out.token_ids)
             sample['output_len'] = len(sample['output_token_ids'])
             sample['sample_ids'] = sample['input_token_ids'] + sample['output_token_ids']
             sample['sample_text'] = self.tokenizer.decode(sample['sample_ids'])
             sample['sample_position_ids'] = list(range(len(sample['sample_ids'])))
-            try:
-                sample['reward'] = await asyncio.wait_for(self.verify_worker.verify.remote(sample), timeout=10)
-            except asyncio.TimeoutError:
-                print(f"Verification timed out for sample {sample['input_token_ids']}")
-                sample['reward'] = 0
+            # sample['reward'] = await self.verifier_registry.verify.remote(sample)
+            reward_tasks.append(self.robust_verify(sample))
         
+        # rewards = await asyncio.gather(*[self.verifier_registry.verify.remote(sample) for sample in samples])
+        rewards = await asyncio.gather(*reward_tasks)
+        for sample, reward in zip(samples, rewards):
+            sample['reward'] = reward
+
         group_rewards = np.array([s['reward'] for s in samples])
         group_advantages = normalize_rewards(group_rewards)
         for sample_, advantage in zip(samples, group_advantages):
@@ -177,26 +184,6 @@ class GenerationVLLMWorker(BaseVLLMWorker):
         
         return samples
 
-parsing_func = partial(parse, extraction_config=[
-    LatexExtractionConfig(
-        boxed_match_priority=0, 
-        normalization_config=NormalizationConfig(
-            boxed="last"
-        )
-    )
-])
-
-@ray.remote
-class VerifierWorker:
-    async def verify(self, sample: dict) -> float:
-        try:
-            return float(verify(
-                parsing_func(r'\boxed{'+sample['gt_answer']+'}'),
-                parsing_func(sample['sample_text']),
-            ))
-        except Exception as e:
-            print(f"Error during verification: {e}")
-            return 0
 
 if __name__ == "__main__":
     ray.init(address="auto", namespace="test")
@@ -205,6 +192,8 @@ if __name__ == "__main__":
     parser.add_argument("--tensor_parallel_size", type=int, default=1, help="Number of tensor parallel units")
     parser.add_argument("--max_num_seqs", type=int, default=16, help="Maximum number of sequences to generate")
     parser.add_argument("--mode", type=str, required=True, choices=["generation", "logprob"], help="Worker mode: generation or logprob")
+    parser.add_argument("--num_verifiers", type=int, default=4,
+                        help="Number of verifier workers")
     args = parser.parse_args()
     
     service_id = f"vllm_worker_{str(uuid.uuid4())}"
@@ -222,7 +211,13 @@ if __name__ == "__main__":
             runtime_env={
                 "pip": [f"vllm --extra-index-url https://wheels.vllm.ai/nightly"]
             },
-        ).remote(args.model_path, service_id, args.tensor_parallel_size, args.max_num_seqs)
+        ).remote(
+            args.model_path,
+            service_id,
+            args.tensor_parallel_size,
+            args.max_num_seqs,
+            args.num_verifiers
+        )
     else:
         raise ValueError(f"Invalid mode: {args.mode}")
     

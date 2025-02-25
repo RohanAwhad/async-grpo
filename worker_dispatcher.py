@@ -12,7 +12,8 @@ import ray
 
 @ray.remote(num_cpus=1)
 class WorkerFactory:
-    def create_worker(self, mode: str, model_path: str, tensor_parallel_size: int, max_num_seqs: int, max_tokens_per_gpu: int = 23000):
+    def create_worker(self, mode: str, model_path: str, tensor_parallel_size: int, max_num_seqs: int,
+                      num_verifiers: int = 100, max_tokens_per_gpu: int = 23000):
         """
         Instantiate the appropriate worker on the remote process after the runtime environment
         is set up. This defers the import of worker-specific modules to the worker process.
@@ -29,6 +30,7 @@ class WorkerFactory:
                 worker_id=service_id,
                 tensor_parallel_size=tensor_parallel_size,
                 max_num_seqs=max_num_seqs,
+                num_verifiers=num_verifiers,
             )
         elif mode == "logprob":
             from logprob_worker import LogprobWorker  # lazy import on remote worker
@@ -61,6 +63,8 @@ if __name__ == "__main__":
                         help="Worker mode: generation or logprob")
     parser.add_argument("--max_tokens_per_gpu", type=int, default=23000,
                         help="Maximum tokens per GPU for logprob worker")
+    parser.add_argument("--num_verifiers", type=int, default=140,
+                        help="Number of verifier workers")
     args = parser.parse_args()
 
     # Initialize Ray.
@@ -84,6 +88,7 @@ if __name__ == "__main__":
         tensor_parallel_size=args.tensor_parallel_size,
         max_num_seqs=args.max_num_seqs,
         max_tokens_per_gpu=args.max_tokens_per_gpu,
+        num_verifiers=args.num_verifiers,
     ))
 
     # Wait for the appropriate registry to be available before moving on.
@@ -127,7 +132,8 @@ for i in (seq 0 3)
             --model_path /dev/shm/qwen7b-math-base \
             --mode generation \
             --tensor_parallel_size 1 \
-            --max_num_seqs 128 &
+            --max_num_seqs 128 \
+            --num_verifiers 100 &
     else
         # CUDA_VISIBLE_DEVICES="$i" python logprob_worker.py --model_path /dev/shm/phi-4 &
         echo "Launching logprob worker on GPU $i..."
