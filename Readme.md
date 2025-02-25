@@ -77,6 +77,8 @@ The unit data structure is the concept of a `sample`. It is a dictionary that sh
 
 Both inference workers register themselves with a registry (defined in [`vllm_registry.py`](vllm_registry.py)). The purpose of the vllm registries is to manage requests sent to the separate pools of workers. They relay requests and load balance across the workers by sending the requests to the worker handling the least amount of data at a time. There is one copy of this process for each type (generation and logprob), and it is created only by the first inference worker to request it.
 
+We also use [worker_dispatcher.py](worker_dispatcher.py) to dispatch the workers. This was needed to isolate the python environment of the two types of inference workers.
+
 #### Generation Worker
 
 The generation worker ([`GenerationVLLMWorker`](vllm_worker.py)) is responsible for generating rollouts. It uses a vllm asynchronous engine to generate these rollouts, and then it utilizes HF's [math-verify](https://github.com/huggingface/Math-Verify) to compute a reward (it expects a `gt_answer` key in the sample dict). This worker also completes most of the sample dict, including defining the IDs used for reference logprobs and training (`sample_position_ids`), as well as the `advantages` used in GRPO (or the normalized rewards across a sample’s rollouts).

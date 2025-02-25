@@ -164,7 +164,11 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             sample['sample_ids'] = sample['input_token_ids'] + sample['output_token_ids']
             sample['sample_text'] = self.tokenizer.decode(sample['sample_ids'])
             sample['sample_position_ids'] = list(range(len(sample['sample_ids'])))
-            sample['reward'] = await self.verify_worker.verify.remote(sample)
+            try:
+                sample['reward'] = await asyncio.wait_for(self.verify_worker.verify.remote(sample), timeout=10)
+            except asyncio.TimeoutError:
+                print(f"Verification timed out for sample {sample['input_token_ids']}")
+                sample['reward'] = 0
         
         group_rewards = np.array([s['reward'] for s in samples])
         group_advantages = normalize_rewards(group_rewards)
@@ -184,7 +188,7 @@ parsing_func = partial(parse, extraction_config=[
 
 @ray.remote
 class VerifierWorker:
-    def verify(self, sample: dict) -> float:
+    async def verify(self, sample: dict) -> float:
         try:
             return float(verify(
                 parsing_func(r'\boxed{'+sample['gt_answer']+'}'),

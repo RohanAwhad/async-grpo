@@ -4,6 +4,7 @@ from datetime import timedelta
 import gc
 import os
 import time
+from typing import List
 import uuid
 import torch
 import ray
@@ -22,20 +23,23 @@ def init_logprob_dist_env():
 
 @ray.remote(num_gpus=1, num_cpus=4)
 class LogprobWorker:
-    def __init__(self, model_path: str, worker_id: str):
+    def __init__(self, model_path: str, worker_id: str, max_tokens_per_gpu: int = 23000):
         self.args = argparse.Namespace(
             model_name_or_path=model_path,
             worker_id=worker_id,
             fsdp_sharding_strategy="FULL_SHARD",
         )
         self.worker_id = worker_id
+        self.max_tokens_per_gpu = max_tokens_per_gpu
         print(f"Initializing {self.__class__.__name__} for logprobs with model path: {model_path}")
         init_logprob_dist_env()
         self.model = setup_model(self.args).cuda()
         self.device = next(self.model.parameters()).device
         self.registry = get_or_create_registry("logprob_vllm_registry")
+        self.batching_queue = asyncio.Queue()
         self._lock = asyncio.Lock()
         self.setup_registration()
+        self._centralizer_loop = asyncio.create_task(self._centralize_inference_requests())
     
     def setup_registration(self):
         try:
@@ -50,34 +54,62 @@ class LogprobWorker:
         gc.collect()
         torch.cuda.empty_cache()
     
-    def update_weights(self, new_state_dict: dict):
-        self.free_memory()
-        from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(self.args.model_name_or_path)
-        model.load_state_dict(new_state_dict, strict=False)
-        print(f"Model loaded successfully on service {self.worker_id}.")
-        self.model = setup_model(self.args, model).cuda()
-        self.device = next(self.model.parameters()).device
-        print(f"Logprob weights updated successfully on service {self.worker_id}.")
-        return True
+    async def update_weights(self, new_state_dict: dict):
+        async with self._lock:
+            self.free_memory()
+            from transformers import AutoModelForCausalLM
+            model = AutoModelForCausalLM.from_pretrained(self.args.model_name_or_path)
+            model.load_state_dict(new_state_dict, strict=False)
+            print(f"Model loaded successfully on service {self.worker_id}.")
+            self.model = setup_model(self.args, model).cuda()
+            self.device = next(self.model.parameters()).device
+            print(f"Logprob weights updated successfully on service {self.worker_id}.")
+            return True
 
     async def inference(self, sample: dict, **kwargs) -> dict:
         """
         Compute log probabilities synchronously using get_per_token_logps, 
         but provide an asynchronous interface.
-        Expected sample dict includes 'input_token_ids' and optionally 'output_token_ids'.
+        Expected sample dict includes 'sample_ids'
         """
-        async with self._lock:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(None, self._compute_logprobs, sample)
-            return result
+        # async with self._lock:
+        #     loop = asyncio.get_running_loop()
+        #     result = await loop.run_in_executor(None, self._compute_logprobs, sample)
+        #     return result
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        await self.batching_queue.put((future, sample))
+        return await future
+    
+    async def _centralize_inference_requests(self):
+        while True:
+            try:
+                inference_requests = []
+                total_length = 0
+                while total_length < self.max_tokens_per_gpu:
+                    try:
+                        request = await asyncio.wait_for(self.batching_queue.get(), timeout=1)
+                        inference_requests.append(request)
+                        total_length += len(request[1]['sample_ids'])
+                    except asyncio.TimeoutError:
+                        break
+                if inference_requests:
+                    futures, samples = zip(*inference_requests)
+                    async with self._lock:  
+                        samples_with_logprobs = self._compute_logprobs(samples)
+                    for future, sample_with_logprobs in zip(futures, samples_with_logprobs):
+                        if not future.done():
+                            future.set_result(sample_with_logprobs)
+            except Exception as e:
+                import traceback
+                print(f"\033[38;5;196mError in centralize inference requests: {e}\033[0m\n{traceback.format_exc()}\n\n")
 
-    def _compute_logprobs(self, sample: dict) -> dict:
+    def _compute_logprobs(self, samples: List[dict]) -> dict:
         """
         Synchronously compute log probabilities from the input sample.
         """
-        output_indices, _ = get_output_logits_indices([sample], self.device)
-        input_ids, position_ids, labels = get_input_for_logprobs([sample], output_indices, self.device)
+        output_indices, _ = get_output_logits_indices(samples, self.device)
+        input_ids, position_ids, labels = get_input_for_logprobs(samples, output_indices, self.device)
 
         self.model.eval()
         with torch.no_grad():
@@ -87,10 +119,12 @@ class LogprobWorker:
                 position_ids=position_ids,
                 labels=labels,
             ).loss
-        
-        # Prepare the final output sample adding computed logprobs.
-        sample['sample_logprobs'] = log_probs.tolist()
-        return sample
+
+        sample_lens = [len(s['sample_ids']) for s in samples]
+        log_probs = torch.split(log_probs, sample_lens)
+        for s, log_prob in zip(samples, log_probs):
+            s['sample_logprobs'] = log_prob.tolist()
+        return samples
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Start logprob worker service")

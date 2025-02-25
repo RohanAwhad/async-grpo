@@ -12,7 +12,7 @@ import ray
 
 @ray.remote(num_cpus=1)
 class WorkerFactory:
-    def create_worker(self, mode: str, model_path: str, tensor_parallel_size: int, max_num_seqs: int):
+    def create_worker(self, mode: str, model_path: str, tensor_parallel_size: int, max_num_seqs: int, max_tokens_per_gpu: int = 23000):
         """
         Instantiate the appropriate worker on the remote process after the runtime environment
         is set up. This defers the import of worker-specific modules to the worker process.
@@ -40,6 +40,7 @@ class WorkerFactory:
             ).remote(
                 model_path=model_path,
                 worker_id=service_id,
+                max_tokens_per_gpu=max_tokens_per_gpu,
             )
         else:
             raise ValueError(f"Invalid mode: {mode}")
@@ -58,6 +59,8 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, required=True,
                         choices=["generation", "logprob"],
                         help="Worker mode: generation or logprob")
+    parser.add_argument("--max_tokens_per_gpu", type=int, default=23000,
+                        help="Maximum tokens per GPU for logprob worker")
     args = parser.parse_args()
 
     # Initialize Ray.
@@ -80,6 +83,7 @@ if __name__ == "__main__":
         model_path=args.model_path,
         tensor_parallel_size=args.tensor_parallel_size,
         max_num_seqs=args.max_num_seqs,
+        max_tokens_per_gpu=args.max_tokens_per_gpu,
     ))
 
     # Wait for the appropriate registry to be available before moving on.
