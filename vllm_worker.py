@@ -3,7 +3,6 @@ from copy import deepcopy
 from hashlib import sha256
 import random
 import time
-import logging
 import ray
 from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
 from vllm.inputs import TokensPrompt
@@ -14,27 +13,7 @@ import atexit
 from vllm_registry import get_or_create_registry  # helper function from registry
 import asyncio
 from math_verify import parse, verify
-
-import numpy as np
-from numba import njit
-logging.getLogger('numba').setLevel(logging.WARNING)
-
-@njit
-def normalize_rewards(rewards):
-    """
-    Normalize rewards within each group to compute advantages.
-
-    Parameters:
-        rewards : np.ndarray (1D)
-            Array of rewards for each sample of shape (n_samples,).
-
-    Returns:
-        np.ndarray (1D)
-            Normalized rewards of shape (n_samples,).
-    """
-    mean = np.mean(rewards)
-    std = np.std(rewards) + 1e-4
-    return (rewards - mean) / std
+import re
 
 class BaseVLLMWorker:
     """
@@ -160,11 +139,6 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             sample['sample_text'] = self.tokenizer.decode(sample['sample_ids'])
             sample['sample_position_ids'] = list(range(len(sample['sample_ids'])))
             sample['reward'] = await self.verify_worker.verify.remote(sample)
-        
-        group_rewards = np.array([s['reward'] for s in samples])
-        group_advantages = normalize_rewards(group_rewards)
-        for sample_, advantage in zip(samples, group_advantages):
-            sample_['advantage'] = advantage.item()
 
         return samples
 
@@ -178,10 +152,15 @@ class VerifierWorker:
             ))
         except Exception as e:
             print(f"Error during verification: {e}")
-            return 0.0
+            return 0
         
-
-
+def extract_boxed(text: str) -> str:
+    """
+    Extracts the content inside the last occurrence of '\\boxed{...}' in the given text.
+    Returns the extracted string if found, or None otherwise.
+    """
+    matches = re.findall(r'\\boxed\{(.*?)\}', text, flags=re.DOTALL)
+    return matches[-1] if matches else None
 
 if __name__ == "__main__":
     ray.init(address="auto", namespace="test")
