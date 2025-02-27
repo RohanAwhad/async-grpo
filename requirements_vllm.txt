@@ -2,3 +2,6 @@
 vllm
 math-verify[antlr4_13_2]
 ray[default]==2.42.1
+rich
+wrapt_timeout_decorator
+filelock

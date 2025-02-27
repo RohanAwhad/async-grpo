@@ -1,7 +1,9 @@
+import importlib
 import os
 import logging
 import inspect
 from datetime import timedelta
+from typing import Any
 
 from rich.logging import RichHandler
 import torch
@@ -47,3 +49,15 @@ def log_rank_0(msg, include_caller=False, rank=None, to_print=False):
             print(msg)
         else:
             logging.info(msg)
+
+def patch_target_module(
+    to_patch: str,
+    replace_with: Any,
+):
+    to_patch = to_patch.split(".")
+    assert len(to_patch) > 1, "must have an object to patch"
+
+    to_patch, obj_name_to_patch = to_patch[:-1], to_patch[-1]
+    to_patch = ".".join(to_patch)
+    source = importlib.import_module(to_patch)
+    setattr(source, obj_name_to_patch, replace_with)

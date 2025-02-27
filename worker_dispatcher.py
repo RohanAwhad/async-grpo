@@ -10,43 +10,44 @@ import time
 import uuid
 import ray
 
-@ray.remote(num_cpus=1)
-class WorkerFactory:
-    def create_worker(self, mode: str, model_path: str, tensor_parallel_size: int, max_num_seqs: int,
-                      num_verifiers: int = 100, max_tokens_per_gpu: int = 23000):
-        """
-        Instantiate the appropriate worker on the remote process after the runtime environment
-        is set up. This defers the import of worker-specific modules to the worker process.
-        """
-        if mode == "generation":
-            from vllm_worker import GenerationVLLMWorker  # lazy import on remote worker
-            service_id = f"generation_worker_{uuid.uuid4()}"
-            worker = GenerationVLLMWorker.options(
-                name=service_id,
-                num_gpus=tensor_parallel_size,
-                num_cpus=4,
-            ).remote(
-                model_path=model_path,
-                worker_id=service_id,
-                tensor_parallel_size=tensor_parallel_size,
-                max_num_seqs=max_num_seqs,
-                num_verifiers=num_verifiers,
-            )
-        elif mode == "logprob":
-            from logprob_worker import LogprobWorker  # lazy import on remote worker
-            service_id = f"logprob_worker_{uuid.uuid4()}"
-            worker = LogprobWorker.options(
-                name=service_id,
-                num_gpus=1,
-                num_cpus=4,
-            ).remote(
-                model_path=model_path,
-                worker_id=service_id,
-                max_tokens_per_gpu=max_tokens_per_gpu,
-            )
-        else:
-            raise ValueError(f"Invalid mode: {mode}")
-        return worker
+@ray.remote
+def create_worker(mode: str, model_path: str, tensor_parallel_size: int, max_num_seqs: int,
+                    num_verifiers: int = 100, max_tokens_per_gpu: int = 23000,
+                    write_failed_generation_samples: bool = False):
+    """
+    Instantiate the appropriate worker on the remote process after the runtime environment
+    is set up. This defers the import of worker-specific modules to the worker process.
+    """
+    if mode == "generation":
+        from vllm_worker import GenerationVLLMWorker  # lazy import on remote worker
+        service_id = f"generation_worker_{uuid.uuid4()}"
+        worker = GenerationVLLMWorker.options(
+            name=service_id,
+            num_gpus=tensor_parallel_size,
+            num_cpus=1,
+        ).remote(
+            model_path=model_path,
+            worker_id=service_id,
+            tensor_parallel_size=tensor_parallel_size,
+            max_num_seqs=max_num_seqs,
+            num_verifiers=num_verifiers,
+            write_failed=write_failed_generation_samples
+        )
+    elif mode == "logprob":
+        from logprob_worker import LogprobWorker  # lazy import on remote worker
+        service_id = f"logprob_worker_{uuid.uuid4()}"
+        worker = LogprobWorker.options(
+            name=service_id,
+            num_gpus=1,
+            num_cpus=2,
+        ).remote(
+            model_path=model_path,
+            worker_id=service_id,
+            max_tokens_per_gpu=max_tokens_per_gpu,
+        )
+    else:
+        raise ValueError(f"Invalid mode: {mode}")
+    return worker
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -63,8 +64,10 @@ if __name__ == "__main__":
                         help="Worker mode: generation or logprob")
     parser.add_argument("--max_tokens_per_gpu", type=int, default=23000,
                         help="Maximum tokens per GPU for logprob worker")
-    parser.add_argument("--num_verifiers", type=int, default=140,
+    parser.add_argument("--num_verifiers", type=int, default=5,
                         help="Number of verifier workers")
+    parser.add_argument("--write_failed_generation_samples", action="store_true",
+                        help="If set, writing failed generation samples to file will be enabled. Do this only on a single node. Clusters with s3fs will corrupt the file.")
     args = parser.parse_args()
 
     # Initialize Ray.
@@ -75,21 +78,27 @@ if __name__ == "__main__":
     runtime_env = {"env_vars": dict(os.environ)}
     runtime_env["env_vars"].pop("CUDA_VISIBLE_DEVICES", None)
     if args.mode == "generation":
-        runtime_env["pip"] = [f"-r {os.path.join(os.path.dirname(__file__), 'requirements_vllm.txt')}"]
+        runtime_env["pip"] = [
+            f"-r {os.path.join(os.path.dirname(__file__), 'requirements_vllm.txt')}",   
+            "math-verify[antlr4_13_2]"
+        ]
+        runtime_env["excludes"] = ["*.pyc", "__pycache__"]
     elif args.mode == "logprob":
         runtime_env["pip"] = [f"-r {os.path.join(os.path.dirname(__file__), 'requirements_fsdp.txt')}"]
 
     # Create the remote factory with the proper runtime_env so that its remote methods
     # execute in the customized environment.
-    factory = WorkerFactory.options(runtime_env=runtime_env).remote()
-    worker = ray.get(factory.create_worker.remote(
+    # factory = WorkerFactory.options(runtime_env=runtime_env).remote()
+    worker = ray.get(create_worker.options(runtime_env=runtime_env).remote(
         mode=args.mode,
         model_path=args.model_path,
         tensor_parallel_size=args.tensor_parallel_size,
         max_num_seqs=args.max_num_seqs,
         max_tokens_per_gpu=args.max_tokens_per_gpu,
         num_verifiers=args.num_verifiers,
+        write_failed_generation_samples=args.write_failed_generation_samples
     ))
+    # del factory
 
     # Wait for the appropriate registry to be available before moving on.
     registry_name = "generation_vllm_registry" if args.mode == "generation" else "logprob_vllm_registry"
@@ -125,21 +134,22 @@ if __name__ == "__main__":
 '''
 mamba activate ray
 set model /dev/shm/qwen7b-math-base
-for i in (seq 0 3)
-    if test $i -lt 2
+for i in (seq 0 7)
+    if test $i -lt 7
         echo "Launching generation worker on GPU $i..."
         python worker_dispatcher.py \
             --model_path /dev/shm/qwen7b-math-base \
             --mode generation \
             --tensor_parallel_size 1 \
             --max_num_seqs 128 \
-            --num_verifiers 100 &
+            --write_failed_generation_samples \
+            --num_verifiers 10 | tee generation_worker_$i.log &
     else
         # CUDA_VISIBLE_DEVICES="$i" python logprob_worker.py --model_path /dev/shm/phi-4 &
         echo "Launching logprob worker on GPU $i..."
         torchrun --nproc_per_node=1 --master_port=1234$i worker_dispatcher.py \
             --model_path /dev/shm/qwen7b-math-base \
-            --mode logprob &
+            --mode logprob | tee logprob_worker_$i.log &
     end
 end
 

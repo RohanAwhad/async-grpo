@@ -1,3 +1,4 @@
+import random
 import numpy as np
 import torch
 import os
@@ -106,11 +107,14 @@ def get_input_for_logprobs(batched_questions, output_indices, device):
 
 def post_process_batch(batched_questions, device):
     output_indices, output_lens = get_output_logits_indices(batched_questions, device)
-    if int(os.environ['LOCAL_RANK']) == 0:
+    if int(os.environ['RANK']) == 0:
+        sample = random.choice(batched_questions)
         print(
-            f"\033[1;96;40mDecoded Sample:\033[0m {batched_questions[0]['sample_text']}\n"
-            f"\033[1;96;40mReward:\033[0m {batched_questions[0]['reward']}\n"
-            f"\033[1;96;40mGround Truth Answer:\033[0m {batched_questions[0]['gt_answer']}\n"
+            f"\033[1;96;40mDecoded Sample:\033[0m {sample['sample_text']}\n" +
+            f"\033[1;96;40mReward:\033[0m {sample['reward']}\n" +
+            f"\033[1;96;40mGround Truth Answer:\033[0m {sample['gt_answer']}\n" +
+            (f"\033[1;96;40mParsed Ground Truth Answer:\033[0m {sample['parsed_gt_answer']}\n" if 'parsed_gt_answer' in sample else "") +
+            (f"\033[1;96;40mParsed Attempt: {sample['parsed_attempt']}\033[0m\n" if 'parsed_attempt' in sample else f"\033[1;38;5;196mFailed verification\033[0m")
         )
     advantages = np.array([s['advantage'] for s in batched_questions])
     # print("\033[1;91;40mDEBUG using sample lens (not outputlens to broadcast)\033[0m")
