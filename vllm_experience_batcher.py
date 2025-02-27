@@ -139,7 +139,7 @@ class ExperienceBatcher:
 
         return True
     
-    async def run_with_timeout(self, coroutine, timeout=1200):
+    async def run_with_timeout(self, coroutine, timeout=600):
         try:
             return await asyncio.wait_for(coroutine, timeout)
         except asyncio.TimeoutError:
