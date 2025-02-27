@@ -121,8 +121,9 @@ def save_model(args, model, accelerator, samples_seen):
     start = time.time()
     output_dir = Path(args.output_dir) / "hf_format" / f"samples_{samples_seen}"
     accelerator.save_model(model,
-                            str(output_dir),
+                           str(output_dir),
                             max_shard_size="20GB",
+                            safe_serialization=True,
     )
     if accelerator.is_main_process:
         model.module.config.to_json_file(str(output_dir / "config.json"))
