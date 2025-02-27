@@ -12,7 +12,7 @@ import ray
 
 @ray.remote
 def create_worker(mode: str, model_path: str, tensor_parallel_size: int, max_num_seqs: int,
-                    num_verifiers: int = 100, max_tokens_per_gpu: int = 23000,
+                    global_num_verifiers: int = 100, max_tokens_per_gpu: int = 23000,
                     write_failed_generation_samples: bool = False):
     """
     Instantiate the appropriate worker on the remote process after the runtime environment
@@ -30,7 +30,7 @@ def create_worker(mode: str, model_path: str, tensor_parallel_size: int, max_num
             worker_id=service_id,
             tensor_parallel_size=tensor_parallel_size,
             max_num_seqs=max_num_seqs,
-            num_verifiers=num_verifiers,
+            global_num_verifiers=global_num_verifiers,
             write_failed=write_failed_generation_samples
         )
     elif mode == "logprob":
@@ -64,8 +64,8 @@ if __name__ == "__main__":
                         help="Worker mode: generation or logprob")
     parser.add_argument("--max_tokens_per_gpu", type=int, default=23000,
                         help="Maximum tokens per GPU for logprob worker")
-    parser.add_argument("--num_verifiers", type=int, default=5,
-                        help="Number of verifier workers")
+    parser.add_argument("--global_num_verifiers", type=int, default=100,
+                        help="Number of verifier workers for the global verifier pool")
     parser.add_argument("--write_failed_generation_samples", action="store_true",
                         help="If set, writing failed generation samples to file will be enabled. Do this only on a single node. Clusters with s3fs will corrupt the file.")
     args = parser.parse_args()
@@ -95,7 +95,7 @@ if __name__ == "__main__":
         tensor_parallel_size=args.tensor_parallel_size,
         max_num_seqs=args.max_num_seqs,
         max_tokens_per_gpu=args.max_tokens_per_gpu,
-        num_verifiers=args.num_verifiers,
+        global_num_verifiers=args.global_num_verifiers,
         write_failed_generation_samples=args.write_failed_generation_samples
     ))
     # del factory
@@ -143,7 +143,7 @@ for i in (seq 0 7)
             --tensor_parallel_size 1 \
             --max_num_seqs 128 \
             --write_failed_generation_samples \
-            --num_verifiers 10 | tee generation_worker_$i.log &
+            --global_num_verifiers 100 | tee generation_worker_$i.log &
     else
         # CUDA_VISIBLE_DEVICES="$i" python logprob_worker.py --model_path /dev/shm/phi-4 &
         echo "Launching logprob worker on GPU $i..."

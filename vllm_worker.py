@@ -6,91 +6,27 @@ import json
 import random
 import logging
 import time
+import asyncio
 import ray
+import logging
+import atexit
+import uuid
+import torch
+import numpy as np
+from numba import njit
 from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
 from vllm.inputs import TokensPrompt
 from transformers import AutoTokenizer
-import torch
-import uuid
-import atexit
-from vllm_registry import get_or_create_registry 
-import asyncio
-# from math_verify import parse, verify
-# from math_verify.parser import LatexExtractionConfig, NormalizationConfig
-import re
-# from verifier_registry import get_or_create_verifier_registry, verify_single
-# from math_verify import parse, verify  # use basic parsing and verification
 
-from filelock import FileLock, Timeout
+from vllm_registry import get_or_create_registry 
+from verifier_pool import get_or_create_verifier_pool
+
 
 import numpy as np
 from numba import njit
 logging.getLogger('numba').setLevel(logging.WARNING)
 
-from utils import patch_target_module
-from wrapt_timeout_decorator import timeout
-# need to patch since we are using the module inside ray. see: 
-patch_target_module("math_verify.utils.timeout", partial(timeout, use_signals=False))
-from math_verify import verify
-from math_verify.parser import LatexExtractionConfig, NormalizationConfig
-from math_verify import parse
 
-def verify_sample(sample: dict) -> float:
-    parsing_func_ = partial(
-        parse,
-        extraction_config=[
-            LatexExtractionConfig(
-                try_extract_without_anchor=False,
-                boxed_match_priority=0, 
-                normalization_config=NormalizationConfig(
-                    boxed="last"
-                )
-            )
-        ],
-        fallback_mode="no_fallback",
-        extraction_mode="first_match",
-        parsing_timeout=20,
-    )
-    parsed_gt_answer = parsing_func_(r'\boxed{' + sample['gt_answer'] + '}')
-    parsed_attempt = parsing_func_(sample['sample_text'])
-    # Run verification.
-    result = float(verify(
-        parsed_gt_answer,
-        parsed_attempt,
-        timeout_seconds=20,
-    ))
-    # gt_answer_parsed = parsing_func_(r'\boxed{' + sample['gt_answer'] + '}')
-    # sample_text_parsed = parsing_func_(sample['sample_text'])
-    # print(f"\033[1;38;2;255;165;0mDEBUG Verifier sample text: \033[0m{sample['sample_text']}\033[1;38;2;255;165;0m with ground truth: \033[0m{sample['gt_answer']}\033[1;38;2;255;165;0m and result: \033[0m{result}", flush=True)
-    # print(f"\033[1;38;2;255;165;0mDEBUG ground truth: \033[0m{gt_answer_parsed}\033[1;38;2;255;165;0m with sample text: \033[0m{sample_text_parsed}")
-    sample['reward'] = result
-    sample['parsed_gt_answer'] = parsed_gt_answer
-    sample['parsed_attempt'] = parsed_attempt
-    return sample
-
-@ray.remote
-class VerifyWorker:
-    def __init__(self, worker_id: str, write_failed: bool = False):
-        self.worker_id = worker_id
-        self.write_failed = write_failed
-        print(f"Initializing VerifyWorker with id: {worker_id}, write_failed: {self.write_failed}")
-    
-    def verify_sample(self, sample: dict) -> float:
-        for _ in range(3):
-            try:
-                return timeout(30, use_signals=False, exception_message="")(verify_sample)(sample)
-            except Exception as e:
-                time.sleep(0.1)
-        print(f"\033[38;5;196m\033[1m DEBUG:Failed to verify \033[0m\n", flush=True)
-        sample['reward'] = 0.0
-        if self.write_failed:
-            try:
-                with FileLock("failed_generation_samples.jsonl.lock", timeout=20):
-                    with open("failed_generation_samples.jsonl", "a") as f:
-                        f.write(json.dumps(sample) + "\n")
-            except Timeout:
-                print("Lock acquisition failed after 20 seconds", flush=True)
-        return sample
 
 @njit
 def normalize_rewards(rewards):
@@ -189,16 +125,10 @@ class BaseVLLMWorker:
 @ray.remote
 class GenerationVLLMWorker(BaseVLLMWorker):
     def __init__(self, model_path: str, worker_id: str, tensor_parallel_size: int, max_num_seqs: int,
-                 num_verifiers: int = 4, write_failed: bool = False):
+                 global_num_verifiers: int = 4, write_failed: bool = False):
         # Pass the common parameters to the base initializer.
         super().__init__(model_path, worker_id, tensor_parallel_size, max_num_seqs)
-        # Create verifier workers while propagating the write_failed flag.
-        self.verifier_pool = [
-            VerifyWorker.options(num_cpus=1).remote(f"verifier_{i}_{str(uuid.uuid4())}", write_failed)
-            for i in range(num_verifiers)
-        ]
-        self.verifier_load = [0] * num_verifiers
-        self.verifier_lock = asyncio.Lock()
+        self.verifier_pool = get_or_create_verifier_pool(global_num_verifiers, write_failed)
         self.registry = get_or_create_registry("generation_vllm_registry")
         self.setup_registration()
     
@@ -214,19 +144,6 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             max_num_seqs=max_num_seqs,
             max_model_len=config.max_position_embeddings,
         )
-    
-    async def verify_balanced(self, sample: dict) -> dict:
-        # Acquire the lock to safely choose the least busy verifier.
-        async with self.verifier_lock:
-            min_index = min(range(len(self.verifier_load)), key=lambda i: self.verifier_load[i])
-            self.verifier_load[min_index] += 1
-            
-        result_ref = self.verifier_pool[min_index].verify_sample.remote(sample)
-        result = await result_ref
-
-        async with self.verifier_lock:
-            self.verifier_load[min_index] -= 1
-        return result
     
     async def inference(self, sample: dict, max_new_tokens: int = None, **kwargs) -> list[dict]:
         # For generation, parameters are flexible.
@@ -253,7 +170,8 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             sample['sample_ids'] = sample['input_token_ids'] + sample['output_token_ids']
             sample['sample_text'] = self.tokenizer.decode(sample['sample_ids'])
             sample['sample_position_ids'] = list(range(len(sample['sample_ids'])))
-            sample_rewards_futures.append(self.verify_balanced(sample))
+            # Use the remote call because verifier_pool is now a ray actor
+            sample_rewards_futures.append(self.verifier_pool.verify_balanced.remote(sample))
 
         samples = await asyncio.gather(*sample_rewards_futures)
         group_rewards = np.array([s['reward'] for s in samples])
