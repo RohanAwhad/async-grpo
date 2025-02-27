@@ -19,13 +19,10 @@ ray start --head --port 6379
 ```
 ```bash
 ray start --head \
-  --num-cpus=0 \                  # Disable task scheduling on head
-  --resources='{"verification_slot":1000}' \
-  --port=6379 \                   # Default GCS port
-  --object-manager-port=8076 \    # Required for large object transfers
-  --min-worker-port=10000 \       # Avoid port conflicts
-  --max-worker-port=20000 \
-  --temp-dir=/dev/shm
+--resources='{"verification_slot":100}' \
+--port=6379 \
+--object-manager-port=8076 \
+--temp-dir=/dev/shm/ray
 ```
 
 worker node/s
@@ -40,19 +37,24 @@ ray start --address=head_node_ip:6379
 
 for example, for a node with 8 GPUs, and using 7 for generation and 1 for logprob, you would do the following:
 ```bash
-for i in $(seq 0 7); do
-    if [ "$i" -lt 7 ]; then
+for i in (seq 0 7)
+    if test $i -lt 7
+        echo "Launching generation worker on GPU $i..."
         python worker_dispatcher.py \
-            --model_path "Qwen/Qwen2.5-Math-7B" \
+            --model_path /dev/shm/qwen7b-math-base \
             --mode generation \
             --tensor_parallel_size 1 \
-            --max_num_seqs 128 &
+            --max_num_seqs 128 \
+            --write_failed_generation_samples \
+            --global_num_verifiers 100 | tee generation_worker_$i.log &
     else
-        torchrun --nproc_per_node=1 --master_port=1234"$i" worker_dispatcher.py \
-            --model_path "Qwen/Qwen2.5-Math-7B" \
-            --mode logprob &
-    fi
-done
+        # CUDA_VISIBLE_DEVICES="$i" python logprob_worker.py --model_path /dev/shm/phi-4 &
+        echo "Launching logprob worker on GPU $i..."
+        torchrun --nproc_per_node=1 --master_port=1234$i worker_dispatcher.py \
+            --model_path /dev/shm/qwen7b-math-base \
+            --mode logprob | tee logprob_worker_$i.log &
+    end
+end
 ```
 
 In our test, we used two nodes, a total of 16 GPUs, 14 for generation and 2 for logprob. you must wait until all the workers are started before starting the training, which is shown by `worker <ID> registered` for each worker.
@@ -72,6 +74,7 @@ the hyperparameters to be tuned are in `trainer_core.py`.
 - when things fail, do ray stop everywhere and restart the process on all nodes. Ray becomes a bit unstable when restarting processes.
 - It's important to create a separate conda environment for the training process or the worker environments will become corrupted. The python version should be the same as the base environment.
 - `ray list actors | grep ALIVE` can be used to check if all the expected workers are running.
+- make sure you can do enough http connections on your cluster: `ulimit -n 65535`
 
 ### Architecture Explanation
 
@@ -95,7 +98,7 @@ The generation worker ([`GenerationVLLMWorker`](vllm_worker.py)) is responsible 
 
 #### Logprob Worker
 
-The logprob worker ([`LogprobWorker`](logprob_worker.py)) computes the log probabilities of the rollouts. It uses the same function as the training process to compute the log probabilities ([`PerTokenLogProbsFromCE`](grpo_loss.py)) and leverages the same utility functions to process the samples into input IDs, position IDs, and labels (e.g. [`get_input_for_logprobs`](sample_processing_utils.py)). It loads the model in the same way as the training process (via [`setup_model`](setup_model.py)) but does not wrap it with FSDP. Note that as of Feb 24th, it processes log probabilities one sample at a time, making it a current bottleneck in the training process.
+The logprob worker ([`LogprobWorker`](logprob_worker.py)) computes the log probabilities of the rollouts. It uses the same function as the training process to compute the log probabilities ([`PerTokenLogProbsFromCE`](grpo_loss.py)) and leverages the same utility functions to process the samples into input IDs, position IDs, and labels (e.g. [`get_input_for_logprobs`](sample_processing_utils.py)). It loads the model in the same way as the training process (via [`setup_model`](setup_model.py)) but does not wrap it with FSDP. It also accumulates samples in a batch [`_centralize_inference_requests`] until a maximum number of tokens per GPU is reached to keep the GPUs usage at max.
 
 #### Updating Inference Worker Weights
 
