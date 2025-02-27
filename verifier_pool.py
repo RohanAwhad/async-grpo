@@ -70,8 +70,12 @@ class VerifierPool:
     def __init__(self, global_num_verifiers: int, write_failed: bool = False):
         self.global_num_verifiers = global_num_verifiers
         self.write_failed = write_failed
-        self.verifier_pool = [VerifierWorker.options(num_cpus=1).remote(f"verifier_{i}_{str(uuid.uuid4())}", write_failed)
-                               for i in range(global_num_verifiers)]
+        self.verifier_pool = [
+            VerifierWorker.options(
+                num_cpus=1, 
+                scheduling_strategy="SPREAD",
+            ).remote(f"verifier_{i}_{str(uuid.uuid4())}", write_failed)
+            for i in range(global_num_verifiers)]
         self.verifier_load = [0 for _ in range(global_num_verifiers)]
         self.lock = asyncio.Lock()
 
