@@ -127,8 +127,8 @@ class GenerationVLLMWorker(BaseVLLMWorker):
     def __init__(self, model_path: str, worker_id: str, tensor_parallel_size: int, max_num_seqs: int,
                  global_num_verifiers: int = 4, write_failed: bool = False):
         # Pass the common parameters to the base initializer.
-        super().__init__(model_path, worker_id, tensor_parallel_size, max_num_seqs)
         self.verifier_pool = get_or_create_verifier_pool(global_num_verifiers, write_failed)
+        super().__init__(model_path, worker_id, tensor_parallel_size, max_num_seqs)
         self.registry = get_or_create_registry("generation_vllm_registry")
         self.setup_registration()
     
