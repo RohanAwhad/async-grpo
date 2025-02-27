@@ -196,6 +196,7 @@ async def train(args,
         log_rank_0(f"Starting iteration {iteration + 1}/{num_iterations}")
 
         for step in range(num_batches_per_ref_model_update):
+            start_time = time.time()
             batch = next(dataloader)
             await batcher_actor.generate_experience.remote(
                 batch,
@@ -210,6 +211,8 @@ async def train(args,
                 ray.get(batcher_actor.start_creating_batches.remote())
             torch.distributed.barrier()
             samples_in_batch = 0
+            reward_accumulated_in_batch = 0
+            output_tokens_in_batch = 0
             async for minibatch in remote_queue_batch_generator(args.global_rank, 
                                                                 device,
                                                                 batcher_actor_name=args.experience_batcher_name):
@@ -249,11 +252,20 @@ async def train(args,
                 accelerator.backward(loss)
 
                 total_samples_accumulated += total_num_samples
+                reward_accumulated_in_batch += total_reward
                 samples_in_batch += total_num_samples
-
+                output_tokens_in_batch += total_num_output_tokens
                 torch.cuda.empty_cache()
             # Always take a gradient step before updating vLLM workers
             take_gradient_step(model, optimizer, lr_scheduler, accelerator, samples_in_batch)
+            if accelerator.is_main_process:
+                print(
+                    f"\033[1;38;2;255;0;255mAverage Reward Accumulated in Batch:\033[0m {reward_accumulated_in_batch/samples_in_batch} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;255;0;255mAverage Output Tokens in Batch:\033[0m {output_tokens_in_batch/samples_in_batch} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;255;0;255mTime taken for batch:\033[0m {time.time() - start_time:.2f} seconds\n"
+                    f"\033[1;38;2;255;0;255mNum samples in batch:\033[0m {samples_in_batch}\n"
+                    f"\033[1;38;2;255;0;255mLearning Rate:\033[0m {lr_scheduler.get_last_lr()}\n"
+                )
 
             if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
                 save_model(args, model, accelerator, total_samples_accumulated)
@@ -293,7 +305,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=128, #TODO: change to 32 for a real experiment
+        default=256, #TODO: change to 32 for a real experiment
         help="Global batch size of questions per gradient step. The batch will be split among GPUs even if not divisible by the number of GPUs."
     )
 
@@ -314,7 +326,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fsdp_sharding_strategy",
         type=str,
-        default="FULL_SHARD",
+        default="SHARD_GRAD_OP",
         choices=["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD", "HYBRID_SHARD"],
         help="Sharding strategy for Fully Sharded Data Parallel."
     )
