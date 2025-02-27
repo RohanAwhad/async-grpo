@@ -82,20 +82,33 @@ class LogprobWorker:
         return await future
     
     async def _centralize_inference_requests(self):
+        # current_request acts as a pending request that didn't fit in the previous batch.
+        current_request = None  
         while True:
             try:
-                inference_requests = []
-                total_length = 0
-                while total_length < self.max_tokens_per_gpu:
+                # If there's no pending request, get one from the queue.
+                # Otherwise, use the one left from the previous batch.
+                current_request = await self.batching_queue.get() if current_request is None else current_request
+                inference_requests = [current_request]
+                total_length = len(current_request[1]['sample_ids'])
+                while True:
                     try:
-                        request = await asyncio.wait_for(self.batching_queue.get(), timeout=1)
-                        inference_requests.append(request)
-                        total_length += len(request[1]['sample_ids'])
+                        # Attempt to retrieve the next request.
+                        current_request = await asyncio.wait_for(self.batching_queue.get(), timeout=1)
+                        len_request = len(current_request[1]['sample_ids'])
+                        # If adding this request would exceed the maximum, break and keep it for next round.
+                        if total_length + len_request > self.max_tokens_per_gpu:
+                            break
+                        # Otherwise, include it in the current batch.
+                        total_length += len_request
+                        inference_requests.append(current_request)
                     except asyncio.TimeoutError:
+                        # Timeout: no more requests available now.
+                        current_request = None
                         break
                 if inference_requests:
                     futures, samples = zip(*inference_requests)
-                    async with self._lock:  
+                    async with self._lock:
                         samples_with_logprobs = self._compute_logprobs(samples)
                     for future, sample_with_logprobs in zip(futures, samples_with_logprobs):
                         if not future.done():
