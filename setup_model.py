@@ -150,5 +150,6 @@ def setup_training_components(args, model):
     # Necessary so that Accelerate does not step once per GPU
     # see https://github.com/huggingface/accelerate/blob/127818fc27ebe5cb236357fff59ff1748326d643/src/accelerate/scheduler.py#L69
     lr_scheduler.split_batches = True
+    lr_scheduler.step() #the scheduler starts at 0 and there's no learning.
     accelerator.register_for_checkpointing(lr_scheduler)
     return model, accelerator, optimizer, lr_scheduler
