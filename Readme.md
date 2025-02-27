@@ -126,7 +126,7 @@ The [train](trainer_core.py) script orchestrates the entire workflow:
 
 #### GRPO Loss Details
 
-Our GRPO loss is mathematically equivalent to that described in the original [GRPO paper](https://arxiv.org/pdf/2402.03300) — specifically, equation 19 (further simplified by having \(\pi_{\theta_{\text{old}}} = \pi_\theta\), as the policy isn’t updated more than once per batch, aligning with equation 20’s gradient).
+Our GRPO loss is mathematically equivalent to that described in the original [GRPO paper](https://arxiv.org/pdf/2402.03300) — specifically, equation 19 (further simplified by having $\pi_{\theta_{\text{old}}} = \pi_\theta$, as the policy isn’t updated more than once per batch, aligning with equation 20’s gradient).
 
 To compute this loss:
 
