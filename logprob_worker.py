@@ -48,23 +48,43 @@ class LogprobWorker:
         except Exception as e:
             print(f"Error during registration for worker {self.worker_id}: {e}")
 
+    # async def start_centralizer_loop(self):
+    #     try:
+    #         if self._centralizer_loop:
+    #             self._centralizer_loop.cancel()
+    #             await self._centralizer_loop
+    #     except asyncio.CancelledError:
+    #         pass
+    #     self._centralizer_loop = asyncio.create_task(self._centralize_inference_requests())
+
     def free_memory(self):
         self.model = self.model.to("cpu")
-        del self.model
+        # del self.model
         gc.collect()
         torch.cuda.empty_cache()
     
     async def update_weights(self, new_state_dict: dict):
-        async with self._lock:
-            self.free_memory()
-            from transformers import AutoModelForCausalLM
-            model = AutoModelForCausalLM.from_pretrained(self.args.model_name_or_path)
-            model.load_state_dict(new_state_dict, strict=False)
-            print(f"Model loaded successfully on service {self.worker_id}.")
-            self.model = setup_model(self.args, model).cuda()
-            self.device = next(self.model.parameters()).device
-            print(f"Logprob weights updated successfully on service {self.worker_id}.")
-            return True
+        # async with self._lock:
+        await self.batching_queue.put(None)
+        await self._centralizer_loop
+        # self.batching_queue.clear()
+        # self.batching_queue = asyncio.Queue()
+        # try:
+        #     if self._centralizer_loop:
+        #         self._centralizer_loop.cancel()
+        #         await self._centralizer_loop
+        # except asyncio.CancelledError:
+        #     pass
+        self.free_memory()
+        # model = AutoModelForCausalLM.from_pretrained(self.args.model_name_or_path)
+        self.model.load_state_dict(new_state_dict, strict=False)
+        self.model = self.model.cuda()
+        print(f"Model loaded successfully on service {self.worker_id}.")
+        # self.model = setup_model(self.args, model).cuda()
+        self.device = next(self.model.parameters()).device
+        self._centralizer_loop = asyncio.create_task(self._centralize_inference_requests())
+        print(f"Logprob weights updated successfully on service {self.worker_id}.")
+        return True
 
     async def inference(self, sample: dict, **kwargs) -> dict:
         """
@@ -78,23 +98,32 @@ class LogprobWorker:
         #     return result
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        await self.batching_queue.put((future, sample))
-        return await future
+        try:
+            await asyncio.wait_for(self.batching_queue.put((future, sample)), timeout=500)
+            result = await asyncio.wait_for(future, timeout=500)
+        except asyncio.TimeoutError:
+            print("\033[1;38;5;196mTimeout error in logprob worker inference method\033[0m")
+            return sample
+        return result
     
     async def _centralize_inference_requests(self):
         # current_request acts as a pending request that didn't fit in the previous batch.
-        current_request = None  
-        while True:
-            try:
-                # If there's no pending request, get one from the queue.
+        async with self._lock:
+            current_request = None  
+            while True:
+                    # If there's no pending request, get one from the queue.
                 # Otherwise, use the one left from the previous batch.
                 current_request = await self.batching_queue.get() if current_request is None else current_request
+                if current_request is None:
+                    return None
                 inference_requests = [current_request]
                 total_length = len(current_request[1]['sample_ids'])
                 while True:
                     try:
                         # Attempt to retrieve the next request.
                         current_request = await asyncio.wait_for(self.batching_queue.get(), timeout=1)
+                        if current_request is None:
+                            return None
                         len_request = len(current_request[1]['sample_ids'])
                         # If adding this request would exceed the maximum, break and keep it for next round.
                         if total_length + len_request > self.max_tokens_per_gpu:
@@ -108,14 +137,16 @@ class LogprobWorker:
                         break
                 if inference_requests:
                     futures, samples = zip(*inference_requests)
-                    async with self._lock:
-                        samples_with_logprobs = self._compute_logprobs(samples)
+                    samples_with_logprobs = self._compute_logprobs(samples)
                     for future, sample_with_logprobs in zip(futures, samples_with_logprobs):
                         if not future.done():
                             future.set_result(sample_with_logprobs)
-            except Exception as e:
-                import traceback
-                print(f"\033[38;5;196mError in centralize inference requests: {e}\033[0m\n{traceback.format_exc()}\n\n")
+        # except Exception as e:
+        #     import traceback
+        #     print(f"\033[38;5;196mError in centralize inference requests: {e}\033[0m\n{traceback.format_exc()}\n\n")
+        #     print(f"Current request: {current_request}")
+        #     print(f"\033[38;5;196mInference requests: {inference_requests}\033[0m")
+        #     raise e
 
     def _compute_logprobs(self, samples: List[dict]) -> dict:
         """
@@ -126,7 +157,6 @@ class LogprobWorker:
 
         self.model.eval()
         with torch.no_grad():
-            # Call the custom per-token logprob function:
             log_probs = self.model(
                 input_ids=input_ids,
                 position_ids=position_ids,
