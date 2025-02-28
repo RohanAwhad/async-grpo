@@ -57,7 +57,7 @@ for i in (seq 0 7)
 end
 ```
 
-In our test, we used two nodes, a total of 16 GPUs, 14 for generation and 2 for logprob. you must wait until all the workers are started before starting the training, which is shown by `worker <ID> registered` for each worker.
+In our test, we used two nodes, a total of 16 GPUs, 14 for generation and 2 for logprob. you must wait until all the workers are started before starting the training, which is shown by `worker <ID> registered` for each worker. Adjust the number of verifiers, each uses one CPU, make sure your cluster has the capacity.
 
 ### start the training on the nodes you want to use for training, we've trained with 8 GPUs on a single training node.
 
@@ -75,6 +75,7 @@ the hyperparameters to be tuned are in `trainer_core.py`.
 - It's important to create a separate conda environment for the training process or the worker environments will become corrupted. The python version should be the same as the base environment.
 - `ray list actors | grep ALIVE` can be used to check if all the expected workers are running.
 - make sure you can do enough http connections on your cluster: `ulimit -n 65535`
+- Ray creates a lot of temporary files in the `/tmp` directory. You can clean them up with `rm -rf /tmp/ray`. Also, you need enough space, otherwise use `ray start --temp-dir=/dev/shm/ray` to use the shared memory as a temporary directory.
 
 ### Architecture Explanation
 
