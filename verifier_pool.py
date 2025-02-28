@@ -75,21 +75,62 @@ def parse_last_boxed(generation: str) -> str:
 #     sample['reward'] = max(result_raw, result_boxed)
 #     return sample
 
-def verify_sample_raw(sample: dict) -> float:
-    attempt_answer, attempt_boxed = parse_last_boxed(sample['sample_text'])
-    reward = float(verify(parse(attempt_answer), parse(sample['gt_answer']), timeout_seconds=1000))
-    sample['parsed_attempt_raw'] = attempt_answer
-    sample['gt_raw'] = sample['gt_answer']
-    sample['reward_raw'] = reward
+def verify_sample_format(sample: dict) -> float:
+    completion = sample['sample_text']
+    try:
+    # add synthetic <think> as its already part of the prompt and prefilled for the assistant to more easily match the regex
+        completion = "<think>" + completion
+        
+        # Check if the format is correct
+        regex = r"^<think>([^<]*(?:<(?!/?think>)[^<]*)*)<\/think>\n<answer>([\s\S]*?)<\/answer>$"
+
+        match = re.search(regex, completion, re.DOTALL) 
+        # if the format is not correct, reward is 0
+        if match is None or len(match.groups()) != 2:
+            reward = 0.0
+        else:
+            reward = 1.0
+    except Exception:
+        reward = 0.0
+
+    sample['reward_format'] = reward
     return sample
 
 
-def verify_sample_boxed(sample: dict) -> float:
-    attempt_answer, attempt_boxed = parse_last_boxed(sample['sample_text'])
-    reward = float(verify(parse(attempt_boxed), parse(r'\boxed{' + sample['gt_answer'] + '}'), timeout_seconds=1000))
-    sample['parsed_attempt_boxed'] = attempt_boxed
-    sample['gt_boxed'] = r'\boxed{' + sample['gt_answer'] + '}'
-    sample['reward_boxed'] = reward
+def verify_sample_equation(sample: dict) -> float:
+    completion = sample['sample_text']
+    gt = sample['gt_answer']
+    numbers = sample['nums']
+    try:
+        # add synthetic <think> as its already part of the prompt and prefilled for the assistant to more easily match the regex
+        completion = "<think>" + completion
+        # Check if the format is correct
+        match = re.search(r"<answer>(.*?)<\/answer>", completion)
+        if match is None:
+            reward = 0.0
+        # Extract the "answer" part from the completion
+        equation = match.group(1).strip()
+        # Extract all numbers from the equation
+        used_numbers = [int(n) for n in re.findall(r'\d+', equation)]
+        
+        # Check if all numbers are used exactly once
+        if sorted(used_numbers) != sorted(numbers):
+            reward = 0.0
+        # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
+        allowed_pattern = r'^[\d+\-*/().\s]+$'
+        if not re.match(allowed_pattern, equation):
+           reward = 0.0        
+        # Evaluate the equation with restricted globals and locals
+        result = eval(equation, {"__builtins__": None}, {})
+        # Check if the equation is correct and matches the ground truth
+        if abs(float(result) - float(gt)) < 1e-5:
+            reward = 1.0
+        else:
+            reward = 0.0
+    except Exception:
+        reward = 0.0
+
+    sample['reward_equation'] = reward
     return sample
 
 
@@ -99,11 +140,11 @@ class VerifierWorker:
         self.worker_id = worker_id
         print(f"Initializing VerifierWorker with id: {worker_id}")
     
-    def verify_sample_raw(self, sample: dict):
-        return verify_sample_raw(sample)
+    def verify_sample_format(self, sample: dict):
+        return verify_sample_format(sample)
     
-    def verify_sample_boxed(self, sample: dict):
-        return verify_sample_boxed(sample)
+    def verify_sample_equation(self, sample: dict):
+        return verify_sample_equation(sample)
 
 @ray.remote
 class VerifierPool:
@@ -145,10 +186,10 @@ class VerifierPool:
                 async with self.lock:
                     min_index = min(range(len(self.verifier_load)), key=lambda i: self.verifier_load[i])
                     self.verifier_load[min_index] += 1
-                if mode == 'raw':
-                    result_ref = self.verifier_pool[min_index].verify_sample_raw.remote(sample)
-                elif mode == 'boxed':
-                    result_ref = self.verifier_pool[min_index].verify_sample_boxed.remote(sample)
+                if mode == 'format':
+                    result_ref = self.verifier_pool[min_index].verify_sample_format.remote(sample)
+                elif mode == 'equation':
+                    result_ref = self.verifier_pool[min_index].verify_sample_equation.remote(sample)
                 result =  await asyncio.wait_for(result_ref, 30)
                 async with self.lock:
                     self.verifier_load[min_index] -= 1
@@ -161,11 +202,11 @@ class VerifierPool:
         return result
  
     async def verify_balanced(self, sample: dict) -> dict:
-        raw_future = asyncio.create_task(self._verify_balanced(sample, 'raw'))
-        boxed_future = asyncio.create_task(self._verify_balanced(sample, 'boxed'))
-        raw_result = await raw_future
-        boxed_result = await boxed_future
-        sample['reward'] = max(raw_result['reward_raw'], boxed_result['reward_boxed'])
+        format_future = asyncio.create_task(self._verify_balanced(sample, 'format'))
+        equation_future = asyncio.create_task(self._verify_balanced(sample, 'equation'))
+        format_result = await format_future
+        equation_result = await equation_future
+        sample['reward'] = format_result['reward_format'] + equation_result['reward_equation']
         return sample
 
 
