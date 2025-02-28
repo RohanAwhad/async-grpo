@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 import logging
 import random
@@ -127,7 +128,6 @@ class VerifierPool:
 
     async def write_failed_sample(self, sample: dict):
         print("\033[38;5;196m\033[1m DEBUG: Failed to verify sample \033[0m", flush=True)
-        sample['reward'] = 0.0
         if self.write_failed:
             try:
                 with FileLock(f"failed_samples_verif.jsonl.lock", timeout=20):
@@ -138,7 +138,8 @@ class VerifierPool:
         return sample
     
     async def _verify_balanced(self, sample: dict, mode: str) -> dict:
-        result = None
+        result = deepcopy(sample)
+        result[f'reward_{mode}'] = 0.0
         for _ in range(2):
             try:
                 async with self.lock:
@@ -155,9 +156,10 @@ class VerifierPool:
             except Exception as e:
                 print(f"\033[1;38;5;196mCoroutine died in verify_balanced with mode: {mode}\033[0m", flush=True)
                 await self.create_verifier(min_index)
+                await self.write_failed_sample(result)
                 await asyncio.sleep(random.uniform(0.1, 5))
         return result
-
+ 
     async def verify_balanced(self, sample: dict) -> dict:
         raw_future = asyncio.create_task(self._verify_balanced(sample, 'raw'))
         boxed_future = asyncio.create_task(self._verify_balanced(sample, 'boxed'))
