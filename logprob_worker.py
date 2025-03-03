@@ -11,6 +11,15 @@ import ray
 from setup_model import setup_model  # Updated function
 from vllm_registry import get_or_create_registry
 from sample_processing_utils import get_output_logits_indices, get_input_for_logprobs
+import logging
+# Set logging level to debug
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+logger.debug("Logging initialized at DEBUG level in logprob_worker.py")
+
 
 def init_logprob_dist_env():
     # torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -58,7 +67,7 @@ class LogprobWorker:
     #     self._centralizer_loop = asyncio.create_task(self._centralize_inference_requests())
 
     def free_memory(self):
-        self.model = self.model.to("cpu")
+        # self.model = self.model.to("cpu")
         # del self.model
         gc.collect()
         torch.cuda.empty_cache()
@@ -77,7 +86,10 @@ class LogprobWorker:
         #     pass
         self.free_memory()
         # model = AutoModelForCausalLM.from_pretrained(self.args.model_name_or_path)
-        self.model.load_state_dict(new_state_dict, strict=False)
+        # self.model.load_state_dict(new_state_dict, strict=False)
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                param.data = new_state_dict[name].to(param.device).to(param.dtype)
         self.model = self.model.cuda()
         print(f"Model loaded successfully on service {self.worker_id}.")
         # self.model = setup_model(self.args, model).cuda()
@@ -99,10 +111,13 @@ class LogprobWorker:
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         try:
-            await asyncio.wait_for(self.batching_queue.put((future, sample)), timeout=500)
-            result = await asyncio.wait_for(future, timeout=500)
-        except asyncio.TimeoutError:
-            print("\033[1;38;5;196mTimeout error in logprob worker inference method\033[0m")
+            await asyncio.wait_for(self.batching_queue.put((future, sample)), timeout=100)
+            result = await asyncio.wait_for(future, timeout=100)
+        except asyncio.TimeoutError as e:
+            import traceback
+            print(f"\033[1;38;5;196mTimeout error in logprob worker inference method: {e}\033[0m")
+            print(f"\033[1;38;5;196mTraceback: {traceback.format_exc()}\033[0m")
+            print(f"\033[1;38;5;196mlength of batching queue: {self.batching_queue.qsize()}\033[0m")
             return sample
         return result
     
@@ -111,11 +126,13 @@ class LogprobWorker:
         async with self._lock:
             current_request = None  
             while True:
-                    # If there's no pending request, get one from the queue.
+                # If there's no pending request, get one from the queue.
                 # Otherwise, use the one left from the previous batch.
                 current_request = await self.batching_queue.get() if current_request is None else current_request
                 if current_request is None:
                     return None
+                logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 118: \033[0m got request with length {len(current_request[1]['sample_ids'])}")
+                logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 118: \033[0m length of batching queue: {self.batching_queue.qsize()}")
                 inference_requests = [current_request]
                 total_length = len(current_request[1]['sample_ids'])
                 while True:
@@ -123,21 +140,27 @@ class LogprobWorker:
                         # Attempt to retrieve the next request.
                         current_request = await asyncio.wait_for(self.batching_queue.get(), timeout=1)
                         if current_request is None:
+                            logging.debug(f"\033[1;38;2;255;255;0m _centralize_inference_requests line 142: \033[0m received sentinel")
                             return None
+                        logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 129: \033[0m got request with length {len(current_request[1]['sample_ids'])}")
+                        logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 129: \033[0m length of batching queue: {self.batching_queue.qsize()}")
                         len_request = len(current_request[1]['sample_ids'])
                         # If adding this request would exceed the maximum, break and keep it for next round.
                         if total_length + len_request > self.max_tokens_per_gpu:
+                            logging.debug(f"\033[1;38;2;255;20;147m _centralize_inference_requests line 147: \033[0m adding this request would exceed the maximum, breaking, total_length: {total_length}, len_request: {len_request}, max_tokens_per_gpu: {self.max_tokens_per_gpu}")
                             break
                         # Otherwise, include it in the current batch.
                         total_length += len_request
                         inference_requests.append(current_request)
                     except asyncio.TimeoutError:
                         # Timeout: no more requests available now.
+                        logging.debug(f"\033[1;38;2;255;0;255m _centralize_inference_requests line 153: \033[0m no more items in the batching queue timeout")
                         current_request = None
                         break
                 if inference_requests:
                     futures, samples = zip(*inference_requests)
                     samples_with_logprobs = self._compute_logprobs(samples)
+                    logging.debug(f"\033[1;38;2;0;255;255m _centralize_inference_requests line 160: \033[0m computed samples_with_logprobs length of batch_queue: {self.batching_queue.qsize()}")
                     for future, sample_with_logprobs in zip(futures, samples_with_logprobs):
                         if not future.done():
                             future.set_result(sample_with_logprobs)
