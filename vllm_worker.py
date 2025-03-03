@@ -32,7 +32,9 @@ logging.getLogger().setLevel(logging.INFO)
 
 
 delimiter = '\n\n'
-special_phrases = ['', 'The answer is \\boxed{', 'Let\'s doublecheck!', 'Alternatively']
+# special_phrases = ['', 'The answer is \\boxed{', 'Let\'s doublecheck!', 'Alternatively']
+special_phrases = ['Let\'s try another method to solve the problem:', 'Now, let\'s think again:', 'Wait!', 'Let\'s doublecheck the work so far.', 'Alternatively', 
+                   'Let\'s look at it from a different perspective:']
 
 def get_indices_of_delimiter(response, delimiter):
     indices = []
@@ -228,7 +230,8 @@ class GenerationVLLMWorker(BaseVLLMWorker):
         }
     
     async def inference(self, sample: dict, **kwargs) -> list[dict]:
-        # For generation, parameters are flexible.
+        insert_reasoning_phrases = kwargs.get("insert_reasoning_phrases", False)
+        
         generation_kwargs = self.get_gen_kwargs(sample, **kwargs)
 
         request_out = await super().inference(sample, **generation_kwargs)
@@ -250,47 +253,43 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             sample_rewards_futures.append(self.verifier_pool.verify_balanced.remote(sample))
         logging.debug(f"\033[1;38;2;255;165;0mFirst sample before rewriting: \033[0m {samples[0]['sample_text']}")
 
-        modified_samples = [deepcopy(sample) for sample in samples]
-        modified_samples = await asyncio.gather(*[rewrite_with_insert_phrase(sample, self.tokenizer) for sample in modified_samples])
-        logging.debug(f"\033[1;38;2;255;165;0mFirst sample after rewriting: \033[0m {modified_samples[0]['input']}")
+        if insert_reasoning_phrases:
+            modified_samples = [deepcopy(sample) for sample in samples]
+            modified_samples = await asyncio.gather(*[rewrite_with_insert_phrase(sample, self.tokenizer) for sample in modified_samples])
+            logging.debug(f"\033[1;38;2;255;165;0mFirst sample after rewriting: \033[0m {modified_samples[0]['input']}")
+            
+            kwargs['n'] = 1
+            modified_requests_out = await asyncio.gather(*[
+                super().inference(s, **self.get_gen_kwargs(s, include_stop_str_in_output=False, **kwargs)) 
+                for s in modified_samples
+            ])
+            modified_rewards_futures = []
+            for modified_sample, sample, out in zip(modified_samples, samples, modified_requests_out):
+                modified_sample['input'] = sample['input']  # original input
+                modified_sample['sample_ids'] = modified_sample['input_token_ids'] + list(out.outputs[0].token_ids)
+                modified_sample['input_token_ids'] = sample['input_token_ids']  # original input token ids
+                modified_sample['output_token_ids'] = modified_sample['sample_ids'][len(modified_sample['input_token_ids']):]
+                modified_sample['output_len'] = len(modified_sample['output_token_ids'])
+                modified_sample['sample_text'] = self.tokenizer.decode(modified_sample['sample_ids'])
+                modified_sample['sample_position_ids'] = list(range(len(modified_sample['sample_ids'])))
+                modified_rewards_futures.append(self.verifier_pool.verify_balanced.remote(modified_sample))
+            logging.debug(f"\033[1;38;2;255;165;0mFirst sample after generating with rewritten input: \033[0m {modified_samples[0]['sample_text']}")
+            modified_results = await asyncio.gather(*modified_rewards_futures)
+            for s in modified_results:
+                s['modified_reward'] = s['reward']
+            final_samples = modified_results + (await asyncio.gather(*sample_rewards_futures))
+        else:
+            final_samples = await asyncio.gather(*sample_rewards_futures)
         
-        kwargs['n'] = 1
-        modified_requests_out = await asyncio.gather(*[
-            super().inference(s, 
-                              **self.get_gen_kwargs(
-                                  s, 
-                                  include_stop_str_in_output=False, 
-                                  **kwargs)) 
-            for s in modified_samples])
-        
-        modified_rewards_futures = []
-        for modified_sample, sample, out in zip(modified_samples, samples, modified_requests_out):
-            modified_sample['input'] = sample['input'] #original input
-            modified_sample['sample_ids'] = modified_sample['input_token_ids'] + list(out.outputs[0].token_ids)
-            modified_sample['input_token_ids'] = sample['input_token_ids'] #original input token ids
-            modified_sample['output_token_ids'] = modified_sample['sample_ids'][len(modified_sample['input_token_ids']):]
-            modified_sample['output_len'] = len(modified_sample['output_token_ids'])
-            modified_sample['sample_text'] = self.tokenizer.decode(modified_sample['sample_ids'])
-            modified_sample['sample_position_ids'] = list(range(len(modified_sample['sample_ids'])))
-            # Use the remote call because verifier_pool is now a ray actor
-            modified_rewards_futures.append(self.verifier_pool.verify_balanced.remote(modified_sample))
-        logging.debug(f"\033[1;38;2;255;165;0mFirst sample after generating with rewritten input: \033[0m {modified_samples[0]['sample_text']}")
-        
-        samples = await asyncio.gather(*sample_rewards_futures)
-        
-        modified_samples = await asyncio.gather(*modified_rewards_futures)
-        for s in modified_samples:
-            s['modified_reward'] = s['reward']
-        
-        samples = modified_samples + samples
-        
-        group_rewards = np.array([s['reward'] for s in samples])
+        group_rewards = np.array([s['reward'] for s in final_samples])
+        max_reward = np.max(group_rewards).item()
         group_advantages = normalize_rewards(group_rewards)
-        for sample_, advantage in zip(samples, group_advantages):
+        for sample_, advantage in zip(final_samples, group_advantages):
             sample_['advantage'] = advantage.item()
+            sample_['max_reward_in_group'] = max_reward
         
-        print(f"\033[38;5;201mWorker \033[0m {self.worker_id} \033[38;5;201mfinished inference with \033[0m {len(samples)} samples.")
-        return samples
+        print(f"\033[38;5;201mWorker \033[0m {self.worker_id} \033[38;5;201mfinished inference with \033[0m {len(final_samples)} samples.")
+        return final_samples
 
 
 if __name__ == "__main__":

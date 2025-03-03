@@ -7,13 +7,14 @@ import ray
 import re
 import random
 
-async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_name, reference_registry_name, temperature=1.0, max_tokens=8192):
+async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_name, reference_registry_name, temperature=1.0, max_tokens=8192, insert_reasoning_phrases=False):
     actor_registry = ray.get_actor(actor_registry_name)
     samples = await actor_registry.inference_balanced.remote(
         sample,
         n=num_samples,
         temperature=temperature,
         max_tokens=max_tokens,
+        insert_reasoning_phrases=insert_reasoning_phrases
     )
     # logging.debug(f"\033[1;38;2;255;165;0mFirst sample before rewriting: \033[0m {samples[0]['sample_text']}")
     # samples = await asyncio.gather(*[rewrite_with_insert_phrase(s) for s in samples])
@@ -113,7 +114,8 @@ class ExperienceBatcher:
                                   reference_registry="logprob_vllm_registry",
                                   temperature=1.0,
                                   max_tokens=8192,
-                                  timeout=600):
+                                  timeout=600,
+                                  insert_reasoning_phrases=False):
         """
         Asynchronously processes a batch of questions to generate and accumulate samples while 
         ensuring that each accumulated batch does not exceed a specified token limit.
@@ -147,7 +149,8 @@ class ExperienceBatcher:
                 actor_registry,
                 reference_registry,
                 temperature=temperature,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                insert_reasoning_phrases=insert_reasoning_phrases
             ) for sample in samples
         ]
         async with self.lock:

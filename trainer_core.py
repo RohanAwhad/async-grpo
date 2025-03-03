@@ -218,6 +218,7 @@ async def train(args,
                 reference_registry="logprob_vllm_registry",
                 temperature=args.temperature,
                 max_tokens=args.max_generation_tokens,
+                insert_reasoning_phrases=args.insert_reasoning_phrases,
                 timeout=1200 # 20 minutes per batch of questions or skipped. --> adjust depending on settings.
             )
             torch.distributed.barrier()
@@ -232,6 +233,7 @@ async def train(args,
             total_modified_reward_in_batch = 0
             delimiter_not_found_in_batch = 0
             total_non_modified_reward_in_batch = 0
+            max_reward_in_group_in_batch = 0
             async for minibatch in remote_queue_batch_generator(args.global_rank, 
                                                                 device,
                                                                 batcher_actor_name=args.experience_batcher_name):
@@ -252,7 +254,8 @@ async def train(args,
                 total_modified_reward, \
                 num_modified_samples, \
                 delimiter_not_found, \
-                total_non_modified_reward = map(
+                total_non_modified_reward, \
+                max_reward_in_group = map(
                     lambda x: x.item(),
                     accelerator.reduce(
                         torch.tensor([
@@ -264,6 +267,7 @@ async def train(args,
                             minibatch["num_modified_samples"],
                             minibatch["delimiter_not_found"],
                             minibatch["total_non_modified_reward"],
+                            minibatch["max_reward_in_group"],
                         ], device=accelerator.device),
                         reduction="sum"
                     )
@@ -291,6 +295,7 @@ async def train(args,
                 num_modified_samples_in_batch += num_modified_samples
                 delimiter_not_found_in_batch += delimiter_not_found
                 total_non_modified_reward_in_batch += total_non_modified_reward
+                max_reward_in_group_in_batch += max_reward_in_group
                 torch.cuda.empty_cache()
             # Always take a gradient step before updating vLLM workers
             take_gradient_step(model, optimizer, lr_scheduler, accelerator, samples_in_batch)
@@ -306,6 +311,7 @@ async def train(args,
                     f"\033[1;38;2;255;0;255mNum Modified Samples in Batch:\033[0m {num_modified_samples_in_batch}\n"
                     f"\033[1;38;2;255;0;255mAverage Delimiter Not Found in Batch:\033[0m {delimiter_not_found_in_batch/num_modified_samples_in_batch}\n"
                     f"\033[1;38;2;255;0;255mAverage Non Modified Reward in Batch:\033[0m {total_non_modified_reward_in_batch/(samples_in_batch - num_modified_samples_in_batch)}\n"
+                    f"\033[1;38;2;255;0;255mAverage Max Reward in Group in Batch:\033[0m {max_reward_in_group_in_batch/samples_in_batch}\n"
                 )
 
             if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
@@ -349,7 +355,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=64, #TODO: change to 32 for a real experiment
+        default=32, #TODO: change to 32 for a real experiment
         help="Global batch size of questions per gradient step. The batch will be split among GPUs even if not divisible by the number of GPUs."
     )
 
@@ -405,6 +411,13 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--insert_reasoning_phrases",
+        action="store_true",
+        default=False,
+        help="Enable rewriting to insert reasoning phrases during inference."
+    )
+
+    parser.add_argument(
         "--data_path",
         type=str,
         # default="/new_data/aldo/v1_reasoning/grpobk/limo_data_cleaned_phi_4_format.jsonl",
@@ -439,19 +452,21 @@ if __name__ == "__main__":
             model, 
             optimizer,
             lr_scheduler,
-            samples_per_question=32, 
+            samples_per_question=128, 
             kl_coeff=0.001,
             accelerator=accelerator,
             num_iterations=1000000,
-            num_batches_per_ref_model_update=100,
+            num_batches_per_ref_model_update=20,
         )
     )
 
 '''
-set -x log_dir /new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter
+# set -x log_dir /new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter
+set -x log_dir /new_data/experiments_rh/deepscaler_replica_new_phrases
 mkdir -p $log_dir
 CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=12345 trainer_core.py \
      --output_dir $log_dir 2>&1 \
+     --insert_reasoning_phrases \
     | tee $log_dir/train.log
 # torchrun --nproc_per_node=4 trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
 set -x rank 0
