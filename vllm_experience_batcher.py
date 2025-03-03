@@ -4,14 +4,26 @@ import time
 import logging
 import ray
 
-async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_name, reference_registry_name, temperature=1.0):
+import re
+import random
+
+async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_name, reference_registry_name, temperature=1.0, max_tokens=8192):
     actor_registry = ray.get_actor(actor_registry_name)
     samples = await actor_registry.inference_balanced.remote(
         sample,
         n=num_samples,
         temperature=temperature,
+        max_tokens=max_tokens,
     )
-
+    # logging.debug(f"\033[1;38;2;255;165;0mFirst sample before rewriting: \033[0m {samples[0]['sample_text']}")
+    # samples = await asyncio.gather(*[rewrite_with_insert_phrase(s) for s in samples])
+    
+    # logging.debug(f"\033[1;38;2;255;165;0mFirst sample after rewriting: \033[0m {samples[0]['input']}")
+    # samples = await asyncio.gather(*[
+    #     actor_registry.inference_balanced.remote(s, n=1, temperature=temperature) 
+    #     for s in samples])
+    
+    # logging.debug(f"\033[1;38;2;255;165;0mFirst sample after rewriting: \033[0m {samples[0]['sample_text']}")
     reference_registry = ray.get_actor(reference_registry_name)
 
     tasks = [reference_registry.inference_balanced.remote(
@@ -76,16 +88,20 @@ class ExperienceBatcher:
         """Continuously consumes tasks from the experience_queue and processes them."""
         async with self.lock:
             for task in asyncio.as_completed(self.experience_queue):
+                logging.debug(f"\033[1;38;2;255;165;0mExperience queue length in _create_batches: {len(self.experience_queue)}\033[0m")
                 samples = await task
                 if samples is None: # underlying coroutine timed out
                     continue
                 for sample in samples:
                     await self.add_sample_to_batches(sample)
+            logging.debug(f"\033[1;38;2;255;165;0mExperience queue length in _create_batches after processing: {len(self.experience_queue)}\033[0m")
             self.experience_queue = []
         
             await self.dispatch_batches()
+            logging.debug(f"\033[1;38;2;255;165;0mLast batch dispatched\033[0m")
             await self.reset_batches()
             await self.dispatch_sentinel()
+            logging.debug(f"\033[1;38;2;255;165;0mSentinel dispatched\033[0m")
 
     async def get_batch(self, global_rank: int):
         return await self.training_processes_queues[global_rank].get()
@@ -96,7 +112,8 @@ class ExperienceBatcher:
                                   actor_registry="generation_vllm_registry", 
                                   reference_registry="logprob_vllm_registry",
                                   temperature=1.0,
-                                  timeout=1200):
+                                  max_tokens=8192,
+                                  timeout=600):
         """
         Asynchronously processes a batch of questions to generate and accumulate samples while 
         ensuring that each accumulated batch does not exceed a specified token limit.
@@ -129,7 +146,8 @@ class ExperienceBatcher:
                 samples_per_question,
                 actor_registry,
                 reference_registry,
-                temperature=temperature
+                temperature=temperature,
+                max_tokens=max_tokens
             ) for sample in samples
         ]
         async with self.lock:

@@ -178,6 +178,17 @@ async def train(args,
     Main training loop following Algorithm 1 from the paper.
     Simplified version since with μ=1, π_old = π_current during sampling.
     """
+    log_rank_0("==================================================")
+    log_rank_0("           TRAINING CONFIGURATION")
+    log_rank_0(f"Num Iterations                  : {num_iterations}")
+    log_rank_0(f"KL Coefficient                  : {kl_coeff}")
+    log_rank_0(f"Num Batches per Ref Model Update: {num_batches_per_ref_model_update}")
+    log_rank_0(f"Samples per Question             : {samples_per_question}")
+    log_rank_0("--------------------------------------------------")
+    log_rank_0("           TRAINING ARGUMENTS (args)")
+    for arg_key, arg_value in sorted(vars(args).items()):
+        log_rank_0(f"{arg_key:30s}: {arg_value}")
+    log_rank_0("==================================================")
     # update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["generation_vllm_registry"])
     model.train()
     dataloader = iter(get_dataloader(args.batch_size, path=args.data_path))
@@ -199,12 +210,14 @@ async def train(args,
         for step in range(num_batches_per_ref_model_update):
             start_time = time.time()
             batch = next(dataloader)
+            torch.distributed.barrier()
             await batcher_actor.generate_experience.remote(
                 batch,
                 samples_per_question,
                 actor_registry="generation_vllm_registry",
                 reference_registry="logprob_vllm_registry",
                 temperature=args.temperature,
+                max_tokens=args.max_generation_tokens,
                 timeout=1200 # 20 minutes per batch of questions or skipped. --> adjust depending on settings.
             )
             torch.distributed.barrier()
@@ -214,6 +227,11 @@ async def train(args,
             samples_in_batch = 0
             reward_accumulated_in_batch = 0
             output_tokens_in_batch = 0
+            kl_div_accumulated_in_batch = 0
+            num_modified_samples_in_batch = 0
+            total_modified_reward_in_batch = 0
+            delimiter_not_found_in_batch = 0
+            total_non_modified_reward_in_batch = 0
             async for minibatch in remote_queue_batch_generator(args.global_rank, 
                                                                 device,
                                                                 batcher_actor_name=args.experience_batcher_name):
@@ -227,13 +245,25 @@ async def train(args,
                 # Gradient scaling divides by the total number of samples in the batch across all GPUs.
                 loss *= int(os.environ["WORLD_SIZE"])
 
-                total_num_output_tokens, total_num_samples, total_reward = map(
+                total_num_output_tokens, \
+                total_num_samples, \
+                total_reward, \
+                total_kl_div, \
+                total_modified_reward, \
+                num_modified_samples, \
+                delimiter_not_found, \
+                total_non_modified_reward = map(
                     lambda x: x.item(),
                     accelerator.reduce(
                         torch.tensor([
                             minibatch["num_output_tokens"],
                             minibatch["num_samples"],
-                            minibatch["total_reward_rank"]
+                            minibatch["total_reward_rank"],
+                            kl_div*minibatch["num_samples"],
+                            minibatch["total_modified_reward"],
+                            minibatch["num_modified_samples"],
+                            minibatch["delimiter_not_found"],
+                            minibatch["total_non_modified_reward"],
                         ], device=accelerator.device),
                         reduction="sum"
                     )
@@ -256,6 +286,11 @@ async def train(args,
                 reward_accumulated_in_batch += total_reward
                 samples_in_batch += total_num_samples
                 output_tokens_in_batch += total_num_output_tokens
+                kl_div_accumulated_in_batch += total_kl_div
+                total_modified_reward_in_batch += total_modified_reward
+                num_modified_samples_in_batch += num_modified_samples
+                delimiter_not_found_in_batch += delimiter_not_found
+                total_non_modified_reward_in_batch += total_non_modified_reward
                 torch.cuda.empty_cache()
             # Always take a gradient step before updating vLLM workers
             take_gradient_step(model, optimizer, lr_scheduler, accelerator, samples_in_batch)
@@ -263,19 +298,25 @@ async def train(args,
                 print(
                     f"\033[1;38;2;255;0;255mAverage Reward Accumulated in Batch:\033[0m {reward_accumulated_in_batch/samples_in_batch} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
                     f"\033[1;38;2;255;0;255mAverage Output Tokens in Batch:\033[0m {output_tokens_in_batch/samples_in_batch} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;255;0;255mAverage KL Div Accumulated in Batch:\033[0m {kl_div_accumulated_in_batch/samples_in_batch} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
                     f"\033[1;38;2;255;0;255mTime taken for batch:\033[0m {time.time() - start_time:.2f} seconds\n"
                     f"\033[1;38;2;255;0;255mNum samples in batch:\033[0m {samples_in_batch}\n"
                     f"\033[1;38;2;255;0;255mLearning Rate:\033[0m {lr_scheduler.get_last_lr()}\n"
+                    f"\033[1;38;2;255;0;255mAverage Modified Reward in Batch:\033[0m {total_modified_reward_in_batch/num_modified_samples_in_batch} \033[1;38;2;255;0;255mNum Modified Samples:\033[0m {num_modified_samples_in_batch}\n"
+                    f"\033[1;38;2;255;0;255mNum Modified Samples in Batch:\033[0m {num_modified_samples_in_batch}\n"
+                    f"\033[1;38;2;255;0;255mAverage Delimiter Not Found in Batch:\033[0m {delimiter_not_found_in_batch/num_modified_samples_in_batch}\n"
+                    f"\033[1;38;2;255;0;255mAverage Non Modified Reward in Batch:\033[0m {total_non_modified_reward_in_batch/(samples_in_batch - num_modified_samples_in_batch)}\n"
                 )
 
             if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
                 save_model(args, model, accelerator, total_samples_accumulated)
                 last_saved_samples = total_samples_accumulated
             
-            # torch.distributed.breakpoint()
-            update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["generation_vllm_registry"])
+            #update both logprob and generation workers at the last step of the ref model update loop
+            registry_actor_names = ["generation_vllm_registry", "logprob_vllm_registry"] if step == num_batches_per_ref_model_update - 1 else ["generation_vllm_registry"]
+            update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=registry_actor_names)
         
-        update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["logprob_vllm_registry"])
+        # update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["logprob_vllm_registry"])
             
 
 
@@ -286,7 +327,9 @@ if __name__ == "__main__":
     # Model and Tokenizer
     parser.add_argument(
         "--model_name_or_path",
-        default="/dev/shm/qwen7b-math-base",
+        # default="/dev/shm/qwen7b-math-base",
+        # default="/dev/shm/qwen-2.5-3b-instruct",
+        default="/dev/shm/Qwen2.5-1.5B-Instruct",
         # default="Qwen/Qwen2.5-Math-7B",
         # default="/dev/shm/phi-4",
         type=str,
@@ -297,7 +340,7 @@ if __name__ == "__main__":
     # Training Parameters
     parser.add_argument(
         "--learning_rate",
-        default=5e-7,
+        default=1e-6,
         type=float,
         # required=True,
         help="Learning rate for training."
@@ -306,7 +349,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=256, #TODO: change to 32 for a real experiment
+        default=64, #TODO: change to 32 for a real experiment
         help="Global batch size of questions per gradient step. The batch will be split among GPUs even if not divisible by the number of GPUs."
     )
 
@@ -320,7 +363,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_warmup_steps",
         type=int,
-        default=40,
+        default=10,
         help="Number of warmup steps for the scheduler."
     )
 
@@ -342,7 +385,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_tokens_per_gpu",
         type=int,
-        default=26000,
+        default=32768,
         help="Maximum number of tokens per GPU."
     )
 
@@ -350,35 +393,43 @@ if __name__ == "__main__":
     parser.add_argument(
         "--temperature",
         type=float,
-        default=1.0,
+        default=0.7,
         help="Sampling temperature for generating experience."
+    )
+
+    parser.add_argument(
+        "--max_generation_tokens",
+        type=int,
+        default=4096,
+        help="Maximum number of tokens to generate per rollout."
     )
 
     parser.add_argument(
         "--data_path",
         type=str,
         # default="/new_data/aldo/v1_reasoning/grpobk/limo_data_cleaned_phi_4_format.jsonl",
-        default="/new_data/aldo/v1_reasoning/math_simplerl_qwen_data_token_ids.jsonl",
+        # default="/new_data/aldo/v1_reasoning/math_simplerl_qwen_data_token_ids.jsonl",
+        # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/countdown.jsonl",
+        default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_initial_prompt.jsonl",
         help="Path to the data file."
     )
 
     parser.add_argument(
         "--min_samples_per_checkpoint",
         type=int,
-        default=64000,
+        default=100000,
         help="Minimum number of samples per checkpoint."
     )
 
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/new_data/experiments_rh/simple_r1_replica_v2",
+        default="/new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter",
         help="Output directory where model checkpoints and configuration files will be saved."
     )
 
     args = parser.parse_args()
     init_distributed_environment(args)
-
     model = setup_model(args)
     model, accelerator, optimizer, lr_scheduler = setup_training_components(args, model)
 
@@ -388,15 +439,25 @@ if __name__ == "__main__":
             model, 
             optimizer,
             lr_scheduler,
-            samples_per_question=64, 
-            kl_coeff=0.04,
+            samples_per_question=32, 
+            kl_coeff=0.001,
             accelerator=accelerator,
-            num_iterations=100000,
-            num_batches_per_ref_model_update=10,
+            num_iterations=1000000,
+            num_batches_per_ref_model_update=100,
         )
     )
 
 '''
-# torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py
-CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=12345 trainer_core.py 2>&1 | tee train_qwen.log
+set -x log_dir /new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter
+mkdir -p $log_dir
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=12345 trainer_core.py \
+     --output_dir $log_dir 2>&1 \
+    | tee $log_dir/train.log
+# torchrun --nproc_per_node=4 trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
+set -x rank 0
+set -Ux NCCL_SOCKET_IFNAME eth1
+set -Ux NCCL_IB_DISABLE 1
+mkdir -p ~/grpo
+torchrun --nnodes=1 --node_rank=$rank --nproc_per_node=8 --rdzv_id=101 \
+    --rdzv_endpoint="10.241.128.17:54367" trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
 '''
