@@ -307,9 +307,9 @@ async def train(args,
                     f"\033[1;38;2;255;0;255mTime taken for batch:\033[0m {time.time() - start_time:.2f} seconds\n"
                     f"\033[1;38;2;255;0;255mNum samples in batch:\033[0m {samples_in_batch}\n"
                     f"\033[1;38;2;255;0;255mLearning Rate:\033[0m {lr_scheduler.get_last_lr()}\n"
-                    f"\033[1;38;2;255;0;255mAverage Modified Reward in Batch:\033[0m {total_modified_reward_in_batch/num_modified_samples_in_batch} \033[1;38;2;255;0;255mNum Modified Samples:\033[0m {num_modified_samples_in_batch}\n"
+                    f"\033[1;38;2;255;0;255mAverage Modified Reward in Batch:\033[0m {total_modified_reward_in_batch/(num_modified_samples_in_batch+1e-6)} \033[1;38;2;255;0;255mNum Modified Samples:\033[0m {num_modified_samples_in_batch}\n"
                     f"\033[1;38;2;255;0;255mNum Modified Samples in Batch:\033[0m {num_modified_samples_in_batch}\n"
-                    f"\033[1;38;2;255;0;255mAverage Delimiter Not Found in Batch:\033[0m {delimiter_not_found_in_batch/num_modified_samples_in_batch}\n"
+                    f"\033[1;38;2;255;0;255mAverage Delimiter Not Found in Batch:\033[0m {delimiter_not_found_in_batch/(num_modified_samples_in_batch+1e-6)}\n"
                     f"\033[1;38;2;255;0;255mAverage Non Modified Reward in Batch:\033[0m {total_non_modified_reward_in_batch/(samples_in_batch - num_modified_samples_in_batch)}\n"
                     f"\033[1;38;2;255;0;255mAverage Max Reward in Group in Batch:\033[0m {max_reward_in_group_in_batch/samples_in_batch}\n"
                 )
@@ -452,7 +452,7 @@ if __name__ == "__main__":
             model, 
             optimizer,
             lr_scheduler,
-            samples_per_question=128, 
+            samples_per_question=256, 
             kl_coeff=0.001,
             accelerator=accelerator,
             num_iterations=1000000,
@@ -462,11 +462,10 @@ if __name__ == "__main__":
 
 '''
 # set -x log_dir /new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter
-set -x log_dir /new_data/experiments_rh/deepscaler_replica_new_phrases
+set -x log_dir /new_data/experiments_rh/deepscaler_replica_no_modification
 mkdir -p $log_dir
-CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=12345 trainer_core.py \
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2  trainer_core.py \
      --output_dir $log_dir 2>&1 \
-     --insert_reasoning_phrases \
     | tee $log_dir/train.log
 # torchrun --nproc_per_node=4 trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
 set -x rank 0
