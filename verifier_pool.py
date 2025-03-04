@@ -1,6 +1,7 @@
 from copy import deepcopy
 import json
 import logging
+from pathlib import Path
 import random
 import shutil
 import time
@@ -21,6 +22,8 @@ from math_verify.parser import LatexExtractionConfig, NormalizationConfig
 import re
 
 import numpy as np
+logging.getLogger().setLevel(logging.DEBUG)
+
 
 def cos_fn(t, T, eta_min, eta_max):
     """Basic cosine function component"""
@@ -56,7 +59,7 @@ def compute_cosine_reward(gen_length, max_length, format_quality, is_correct,
 
     reward += cos_fn(gen_length, max_length, r_f_0, r_f_L) if format_quality == 1 else 0
     
-    return reward
+    return reward.item()
 
 @ray.remote
 class VerifierWorker:
@@ -77,108 +80,132 @@ class VerifierWorker:
             sample['parsed_attempt'] = ''
         return sample
     
+    def verify_both(self, sample: dict, max_gen_length: int):
+        sample = self.extract_reference_and_answer(sample)
+        sample['original_reward'] = grade_answer_mathd(sample['parsed_attempt'], sample['parsed_gt_answer']) or grade_answer_sympy(sample['parsed_attempt'], sample['parsed_gt_answer'])
+        # TODO: Add cosine reward
+        sample['reward'] = sample['original_reward']
+        return sample
+    
     def verify_mathd(self, sample: dict, max_gen_length: int):
         sample = self.extract_reference_and_answer(sample)
         sample['original_reward'] = grade_answer_mathd(sample['parsed_attempt'], sample['parsed_gt_answer'])
-        sample['reward'] = compute_cosine_reward(sample['output_len'], 
-                                                 max_gen_length, 
-                                                 format_quality=sample['parsed_attempt'] != '', 
-                                                 is_correct=sample['original_reward'])
+        sample['reward'] = sample['original_reward']
+        # sample['reward'] = compute_cosine_reward(sample['output_len'], 
+        #                                          max_gen_length, 
+        #                                          format_quality=sample['parsed_attempt'] != '', 
+        #                                          is_correct=sample['original_reward'])
         return sample
     
     def verify_sympy(self, sample: dict, max_gen_length: int):
         sample = self.extract_reference_and_answer(sample)
         sample['original_reward'] = grade_answer_sympy(sample['parsed_attempt'], sample['parsed_gt_answer'])
-        sample['reward'] = compute_cosine_reward(sample['output_len'], 
-                                                 max_gen_length, 
-                                                 format_quality=sample['parsed_attempt'] != '', 
-                                                 is_correct=sample['original_reward'])
+        sample['reward'] = sample['original_reward']
+        # sample['reward'] = compute_cosine_reward(sample['output_len'], 
+        #                                          max_gen_length, 
+        #                                          format_quality=sample['parsed_attempt'] != '', 
+        #                                          is_correct=sample['original_reward'])
         return sample
 
 @ray.remote
 class VerifierPool:
-    def __init__(self, global_num_verifiers: int, write_failed: bool = False):
+    def __init__(self, global_num_verifiers: int, write_failed: bool = False, output_dir: str = None):
         self.node_id = ray.get_runtime_context().get_node_id()
         self.global_num_verifiers = global_num_verifiers
         self.write_failed = write_failed
-        self.verifier_pool = [None for _ in range(global_num_verifiers)]
-        self.verifier_load = [0 for _ in range(global_num_verifiers)]
         self.lock = asyncio.Lock()
-        self.create_verifier_tasks = [asyncio.create_task(self.create_verifier(i)) for i in range(global_num_verifiers)]
-        shutil.rmtree(f"failed_samples_verify.jsonl", ignore_errors=True)
-        shutil.rmtree(f"failed_samples_verify.jsonl.lock", ignore_errors=True)
+        # Split the global verifiers between mathd and sympy
+        n_mathd = global_num_verifiers // 2
+        n_sympy = global_num_verifiers - n_mathd
+        self.verifier_pool_mathd = [None for _ in range(n_mathd)]
+        self.verifier_load_mathd = [0 for _ in range(n_mathd)]
+        self.verifier_pool_sympy = [None for _ in range(n_sympy)]
+        self.verifier_load_sympy = [0 for _ in range(n_sympy)]
+        self.create_verifier_tasks = ([asyncio.create_task(self.create_verifier_mathd(i)) for i in range(n_mathd)] +
+                                       [asyncio.create_task(self.create_verifier_sympy(i)) for i in range(n_sympy)])
         self.time_since_last_failed = time.time()
-
-    async def create_verifier(self, index: int):
+        self.outfile = Path(output_dir) / "failed_samples_verify.jsonl" if output_dir is not None else Path("failed_samples_verify.jsonl")
+        self.outfile.unlink(missing_ok=True)
+        Path(str(self.outfile)+'.lock').unlink(missing_ok=True)
+        
+    async def create_verifier_mathd(self, index: int):
         async with self.lock:
-            self.verifier_pool[index] = VerifierWorker.options(
+            self.verifier_pool_mathd[index] = VerifierWorker.options(
                 num_cpus=1, 
                 scheduling_strategy="SPREAD",
-            ).remote(f"verifier_{index}_{str(uuid.uuid4())}", self.write_failed)
-            self.verifier_load[index] = 0
+            ).remote(f"verifier_mathd_{index}_{str(uuid.uuid4())}")
+            self.verifier_load_mathd[index] = 0
+
+    async def create_verifier_sympy(self, index: int):
+        async with self.lock:
+            self.verifier_pool_sympy[index] = VerifierWorker.options(
+                num_cpus=1, 
+                scheduling_strategy="SPREAD",
+            ).remote(f"verifier_sympy_{index}_{str(uuid.uuid4())}")
+            self.verifier_load_sympy[index] = 0
 
     async def write_failed_sample(self, sample: dict):
         print("\033[38;5;196m\033[1m DEBUG: Failed to verify sample \033[0m", flush=True)
         if self.write_failed:
             try:
-                with FileLock(f"failed_samples_verif.jsonl.lock", timeout=20):
-                    with open(f"failed_samples_verify.jsonl", "a") as f:
+                with FileLock(f"{self.outfile}.lock", timeout=20):
+                    with open(self.outfile, "a") as f:
                         f.write(json.dumps(sample) + "\n")
             except Timeout:
                 print("Lock acquisition failed after 20 seconds", flush=True)
         return sample
     
-    async def _verify_balanced(self, sample: dict, mode: str, **kwargs) -> dict:
-        result = deepcopy(sample)
-        # result[f'reward_{mode}'] = 0.0
-        result['reward'] = 0.0
+    async def _verify_single(self, sample: dict, mode: str, **kwargs) -> dict:
+        result = sample
         for _ in range(2):
             try:
-                async with self.lock:
-                    min_index = min(range(len(self.verifier_load)), key=lambda i: self.verifier_load[i])
-                    self.verifier_load[min_index] += 1
                 if mode == 'mathd':
-                    result_ref = self.verifier_pool[min_index].verify_mathd.remote(result, **kwargs)
+                    async with self.lock:
+                        min_index = min(range(len(self.verifier_load_mathd)), key=lambda i: self.verifier_load_mathd[i])
+                        self.verifier_load_mathd[min_index] += 1
+                    result_ref = self.verifier_pool_mathd[min_index].verify_mathd.remote(sample, kwargs['max_gen_length'])
+                    result = await asyncio.wait_for(result_ref, 30)
+                    async with self.lock:
+                        self.verifier_load_mathd[min_index] -= 1
                 elif mode == 'sympy':
-                    result_ref = self.verifier_pool[min_index].verify_sympy.remote(result, **kwargs)
+                    async with self.lock:
+                        min_index = min(range(len(self.verifier_load_sympy)), key=lambda i: self.verifier_load_sympy[i])
+                        self.verifier_load_sympy[min_index] += 1
+                    result_ref = self.verifier_pool_sympy[min_index].verify_sympy.remote(sample, kwargs['max_gen_length'])
+                    result = await asyncio.wait_for(result_ref, 30)
+                    async with self.lock:
+                        self.verifier_load_sympy[min_index] -= 1
                 else:
                     raise ValueError(f"Invalid mode: {mode}")
-                result =  await asyncio.wait_for(result_ref, 30)
-                async with self.lock:
-                    self.verifier_load[min_index] -= 1
-                break
+                # break
             except Exception as e:
-                if time.time() - self.time_since_last_failed > 60:
-                    import traceback
-                    traceback.print_exc()
-                    print(f"\033[1;38;5;196mCoroutine died in verify_balanced\033[0m", flush=True)
-                    print(f"\033[1;38;5;196mSample Text: \033[0m {sample['sample_text'][-100:]}", flush=True)
-                    print(f"\033[1;38;5;196mSample Answer: \033[0m {sample['answer']}", flush=True)
-                    async with self.lock:
-                        self.time_since_last_failed = time.time()
-                # raise e
-                await self.create_verifier(min_index)
-                await self.write_failed_sample(result)
-                await asyncio.sleep(random.uniform(0.1, 5))
+                if mode == 'mathd':
+                    await self.create_verifier_mathd(min_index)
+                else:
+                    await self.create_verifier_sympy(min_index)
+                await asyncio.sleep(random.uniform(0.01, 0.05))
         return result
     
-    def pick_verified_sample(self, results: list[dict]) -> dict:
-        '''
-        Pick the first verified sample that is correct. or the first verified sample that was parsed.
-        '''
+    async def pick_verified_sample(self, results: list[dict]) -> dict:
+        # Choose the result with the highest reward or non '' parsed_attempt
         for result in results:
-            if result['original_reward']:
+            if result['original_reward'] > 0:
                 return result
         for result in results:
             if result['parsed_attempt'] != '':
                 return result
+        await self.write_failed_sample(results[0])
         return results[0]
- 
+
     async def verify_balanced(self, sample: dict, **kwargs) -> dict:
-        tasks = [asyncio.create_task(self._verify_balanced(sample, 'mathd', **kwargs)),
-                 asyncio.create_task(self._verify_balanced(sample, 'sympy', **kwargs))]
+        # Run both mathd and sympy verification tasks concurrently
+        sample['original_reward'] = 0.0
+        sample['reward'] = 0.0
+        sample['parsed_attempt'] = ''
+        tasks = [asyncio.create_task(self._verify_single(deepcopy(sample), 'mathd', **kwargs)),
+                 asyncio.create_task(self._verify_single(deepcopy(sample), 'sympy', **kwargs))]
         results = await asyncio.gather(*tasks)
-        return self.pick_verified_sample(results)
+        return await self.pick_verified_sample(results)
 
 
 def get_or_create_verifier_pool(global_num_verifiers: int, write_failed: bool = False) -> VerifierPool:
