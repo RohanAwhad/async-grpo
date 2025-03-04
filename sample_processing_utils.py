@@ -107,10 +107,15 @@ def get_input_for_logprobs(batched_questions, output_indices, device):
 
 def post_process_batch(batched_questions, device):
     output_indices, output_lens = get_output_logits_indices(batched_questions, device)
+    modified_samples = [q for q in batched_questions if q['modified_reward'] is not None]
+    non_modified_samples = [q for q in batched_questions if q['modified_reward'] is None]
     if int(os.environ['RANK']) == 0:
-        sample = random.choice(batched_questions)
+        if len(modified_samples) > 0:
+            sample = random.choice(modified_samples)
+        else:
+            sample = random.choice(batched_questions)
         print(
-            f"\033[1;96;40mDecoded Sample:\033[0m {sample['sample_text']}\n" +
+            f"\033[1;96;40mDecoded Sample:\033[0m {sample['sample_text'][:200]}\n ... \n{sample['sample_text'][-200:]}\n" +
             f"\033[1;96;40mReward:\033[0m {sample['reward']}\n" +
             f"\033[1;96;40mGround Truth Answer:\033[0m {sample['answer']}\n" +
             (f"\033[1;96;40mParsed Ground Truth Answer:\033[0m {sample['parsed_gt_answer']}\n" if 'parsed_gt_answer' in sample else "") +
@@ -167,10 +172,11 @@ def post_process_batch(batched_questions, device):
         "output_lens_broadcasted": output_lens_broadcasted.contiguous(),
         "num_output_tokens": torch.tensor(output_lens.sum(), device=device, dtype=torch.float32),
         "num_samples": torch.tensor(len(batched_questions), device=device, dtype=torch.float32),
-        "total_modified_reward": torch.tensor(sum([s['modified_reward'] for s in batched_questions if s['modified_reward'] is not None]), device=device, dtype=torch.float32),
-        "total_non_modified_reward": torch.tensor(sum([s['reward'] for s in batched_questions if s['modified_reward'] is None]), device=device, dtype=torch.float32),
-        "num_modified_samples": torch.tensor(sum([s['modified_reward'] is not None for s in batched_questions]), device=device, dtype=torch.float32),
-        "delimiter_not_found": torch.tensor(sum([s['delimiter_not_found'] for s in batched_questions if s['modified_reward'] is not None]), device=device, dtype=torch.float32),
+        "max_reward_in_group": torch.tensor(sum([s['max_reward_in_group'] for s in batched_questions]), device=device, dtype=torch.float32),
+        "total_modified_reward": torch.tensor(sum([s['modified_reward'] for s in modified_samples]), device=device, dtype=torch.float32) if len(modified_samples) > 0 else torch.tensor(0.0, device=device, dtype=torch.float32),
+        "total_non_modified_reward": torch.tensor(sum([s['reward'] for s in non_modified_samples]), device=device, dtype=torch.float32) if len(non_modified_samples) > 0 else torch.tensor(0.0, device=device, dtype=torch.float32),
+        "num_modified_samples": torch.tensor(len(modified_samples), device=device, dtype=torch.float32),
+        "delimiter_not_found": torch.tensor(sum([s['delimiter_not_found'] for s in modified_samples]), device=device, dtype=torch.float32) if len(modified_samples) > 0 else torch.tensor(0.0, device=device, dtype=torch.float32),
         "samples": batched_questions,
         "labels": labels,
         "total_reward_rank": torch.tensor(sum([s['reward'] for s in batched_questions]), device=device, dtype=torch.float32),
