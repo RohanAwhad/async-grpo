@@ -16,6 +16,7 @@ from setup_model import setup_model, setup_training_components
 from grpo_loss import compute_grpo_loss
 from utils import init_distributed_environment, log_rank_0, setup_logger
 from sample_processing_utils import post_process_batch
+from batch_metrics import BatchMetrics
 
 
 class JsonlDataset(Dataset):
@@ -163,6 +164,7 @@ def take_gradient_step(model, optimizer, lr_scheduler, accelerator, total_sample
     optimizer.step()
     lr_scheduler.step()
     optimizer.zero_grad()
+    return grad_norm
 
 async def train(args,
                 policy_model, 
@@ -199,7 +201,7 @@ async def train(args,
     batcher_actor = ray.get_actor(args.experience_batcher_name, namespace="test")
     total_samples_accumulated = 0
     last_saved_samples = 0
-
+    batch_totals = BatchMetrics()
     # actor_registry = ray.get_actor("generation_vllm_registry")
     # reference_registry = ray.get_actor("logprob_vllm_registry")
     
@@ -225,93 +227,65 @@ async def train(args,
             if accelerator.is_main_process:
                 ray.get(batcher_actor.start_creating_batches.remote())
             torch.distributed.barrier()
-            samples_in_batch = 0
-            reward_accumulated_in_batch = 0
-            output_tokens_in_batch = 0
-            kl_div_accumulated_in_batch = 0
-            num_modified_samples_in_batch = 0
-            total_modified_reward_in_batch = 0
-            delimiter_not_found_in_batch = 0
-            total_non_modified_reward_in_batch = 0
-            max_reward_in_group_in_batch = 0
+
+            # Initialize a Metrics instance for accumulating minibatch metrics
+            batch_totals.reset_batch()
             async for minibatch in remote_queue_batch_generator(args.global_rank, 
                                                                 device,
                                                                 batcher_actor_name=args.experience_batcher_name):
-                loss, loss_rank, pg_loss, kl_div = compute_grpo_loss(
+                loss, loss_metrics, pg_loss, kl_div = compute_grpo_loss(
                     policy_model,
                     minibatch,
                     kl_coeff,
                 )
-
                 # Multiply the loss by the number of GPUs to account for FSDP's mean reduction.
                 # Gradient scaling divides by the total number of samples in the batch across all GPUs.
                 loss *= int(os.environ["WORLD_SIZE"])
-
-                total_num_output_tokens, \
-                total_num_samples, \
-                total_reward, \
-                total_kl_div, \
-                total_modified_reward, \
-                num_modified_samples, \
-                delimiter_not_found, \
-                total_non_modified_reward, \
-                max_reward_in_group = map(
-                    lambda x: x.item(),
-                    accelerator.reduce(
-                        torch.tensor([
-                            minibatch["num_output_tokens"],
-                            minibatch["num_samples"],
-                            minibatch["total_reward_rank"],
-                            kl_div*minibatch["num_samples"],
-                            minibatch["total_modified_reward"],
-                            minibatch["num_modified_samples"],
-                            minibatch["delimiter_not_found"],
-                            minibatch["total_non_modified_reward"],
-                            minibatch["max_reward_in_group"],
-                        ], device=accelerator.device),
-                        reduction="sum"
-                    )
-                )
-                
-                print(
-                    f"\033[1;38;2;255;165;0mActual Loss:\033[0m {loss.item()} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}\n"
-                    f"\033[1;38;2;255;165;0mLoss Rank:\033[0m {loss_rank} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}\n"
-                    f"\033[1;38;2;255;165;0mPG Loss:\033[0m {pg_loss} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}\n"
-                    f"\033[1;38;2;255;165;0mKL Div:\033[0m {kl_div} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}\n"
-                )
-                if accelerator.is_main_process:
-                    print(
-                        f"\033[1;38;2;255;255;0mAverage Total Output Tokens:\033[0m {total_num_output_tokens/total_num_samples} \033[1;38;2;255;255;0mRank:\033[0m {accelerator.process_index}\n"
-                        f"\033[1;38;2;255;255;0mAverage Reward:\033[0m {total_reward/total_num_samples} \033[1;38;2;255;255;0mRank:\033[0m {accelerator.process_index}\n"
-                    )
                 accelerator.backward(loss)
-
-                total_samples_accumulated += total_num_samples
-                reward_accumulated_in_batch += total_reward
-                samples_in_batch += total_num_samples
-                output_tokens_in_batch += total_num_output_tokens
-                kl_div_accumulated_in_batch += total_kl_div
-                total_modified_reward_in_batch += total_modified_reward
-                num_modified_samples_in_batch += num_modified_samples
-                delimiter_not_found_in_batch += delimiter_not_found
-                total_non_modified_reward_in_batch += total_non_modified_reward
-                max_reward_in_group_in_batch += max_reward_in_group
                 torch.cuda.empty_cache()
-            # Always take a gradient step before updating vLLM workers
-            take_gradient_step(model, optimizer, lr_scheduler, accelerator, samples_in_batch)
+
+                
+                # Accumulate metrics in the Metrics instance
+                batch_totals.accumulate_minibatch_metrics(
+                    output_tokens = minibatch["num_output_tokens"],
+                    samples = minibatch["num_samples"],
+                    reward = minibatch["total_reward_rank"],
+                    modified_reward = minibatch["total_modified_reward"],
+                    modified_samples = minibatch["num_modified_samples"],
+                    delimiter_not_found = minibatch["delimiter_not_found"],
+                    non_modified_reward = minibatch["total_non_modified_reward"],
+                    max_reward_in_group = minibatch["max_reward_in_group"],
+                    loss = loss_metrics,
+                    pg_loss = pg_loss,
+                    kl_div = kl_div,
+                )
+
+            # End async for
+
+            # Reduce minibatch metrics and accumulate into batch_metrics
+            batch_totals.reduce_batch_metrics(accelerator)
+
+            # Use accumulated metrics for gradient step and logging
+            bm = batch_totals.totals
+            batch_num_samples = bm["samples"]
+            total_samples_accumulated += batch_num_samples
+            grad_norm = take_gradient_step(model, optimizer, lr_scheduler, accelerator, batch_num_samples)
+
             if accelerator.is_main_process:
                 print(
-                    f"\033[1;38;2;255;0;255mAverage Reward Accumulated in Batch:\033[0m {reward_accumulated_in_batch/samples_in_batch} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
-                    f"\033[1;38;2;255;0;255mAverage Output Tokens in Batch:\033[0m {output_tokens_in_batch/samples_in_batch} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
-                    f"\033[1;38;2;255;0;255mAverage KL Div Accumulated in Batch:\033[0m {kl_div_accumulated_in_batch/samples_in_batch} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
-                    f"\033[1;38;2;255;0;255mTime taken for batch:\033[0m {time.time() - start_time:.2f} seconds\n"
-                    f"\033[1;38;2;255;0;255mNum samples in batch:\033[0m {samples_in_batch}\n"
+                    f"\033[1;38;2;255;0;255mAverage Reward Accumulated in Batch:\033[0m {bm['reward']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;255;0;255mAverage Output Tokens in Batch:\033[0m {bm['output_tokens']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;255;0;255mAverage Loss in Batch:\033[0m {bm['loss']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
                     f"\033[1;38;2;255;0;255mLearning Rate:\033[0m {lr_scheduler.get_last_lr()}\n"
-                    f"\033[1;38;2;255;0;255mAverage Modified Reward in Batch:\033[0m {total_modified_reward_in_batch/(num_modified_samples_in_batch+1e-6)} \033[1;38;2;255;0;255mNum Modified Samples:\033[0m {num_modified_samples_in_batch}\n"
-                    f"\033[1;38;2;255;0;255mNum Modified Samples in Batch:\033[0m {num_modified_samples_in_batch}\n"
-                    f"\033[1;38;2;255;0;255mAverage Delimiter Not Found in Batch:\033[0m {delimiter_not_found_in_batch/(num_modified_samples_in_batch+1e-6)}\n"
-                    f"\033[1;38;2;255;0;255mAverage Non Modified Reward in Batch:\033[0m {total_non_modified_reward_in_batch/(samples_in_batch - num_modified_samples_in_batch)}\n"
-                    f"\033[1;38;2;255;0;255mAverage Max Reward in Group in Batch:\033[0m {max_reward_in_group_in_batch/samples_in_batch}\n"
+                    f"\033[1;38;2;255;0;255mAverage PG Loss in Batch:\033[0m {bm['pg_loss']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;255;0;255mAverage KL Div Accumulated in Batch:\033[0m {bm['kl_div']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;255;0;255mAverage Modified Reward in Batch:\033[0m {bm['modified_reward']/(bm['modified_samples']+1e-6)} \033[1;38;2;255;0;255m Num Modified Samples:\033[0m {bm['modified_samples']}\n"
+                    f"\033[1;38;2;255;0;255mAverage Delimiter Not Found in Batch:\033[0m {bm['delimiter_not_found']/(bm['modified_samples']+1e-6)}\n"
+                    f"\033[1;38;2;255;0;255mAverage Non Modified Reward in Batch:\033[0m {bm['non_modified_reward']/(batch_num_samples - bm['modified_samples'])}\n"
+                    f"\033[1;38;2;255;0;255mAverage Max Reward in Group in Batch:\033[0m {bm['max_reward_in_group']/batch_num_samples}\n"
+                    f"\033[1;38;2;255;0;255mGrad Norm:\033[0m {grad_norm} samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;0;255;0mSamples in Current Batch:\033[0m {bm['samples']}\n"
+                    f"\033[1;38;2;255;0;255mTime taken for batch:\033[0m {time.time() - start_time:.2f} seconds\n"
                 )
 
             if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
@@ -335,7 +309,8 @@ if __name__ == "__main__":
         "--model_name_or_path",
         # default="/dev/shm/qwen7b-math-base",
         # default="/dev/shm/qwen-2.5-3b-instruct",
-        default="/dev/shm/Qwen2.5-1.5B-Instruct",
+        # default="/dev/shm/Qwen2.5-1.5B-Instruct",
+        default="/dev/shm/Qwen2.5-1.5B",
         # default="Qwen/Qwen2.5-Math-7B",
         # default="/dev/shm/phi-4",
         type=str,
@@ -346,7 +321,7 @@ if __name__ == "__main__":
     # Training Parameters
     parser.add_argument(
         "--learning_rate",
-        default=1e-6,
+        default=1.5e-5,
         type=float,
         # required=True,
         help="Learning rate for training."
@@ -423,7 +398,8 @@ if __name__ == "__main__":
         # default="/new_data/aldo/v1_reasoning/grpobk/limo_data_cleaned_phi_4_format.jsonl",
         # default="/new_data/aldo/v1_reasoning/math_simplerl_qwen_data_token_ids.jsonl",
         # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/countdown.jsonl",
-        default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_initial_prompt.jsonl",
+        # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_initial_prompt.jsonl",
+        default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_initial_prompt_qwen1.5b_base.jsonl",
         help="Path to the data file."
     )
 
@@ -452,7 +428,7 @@ if __name__ == "__main__":
             model, 
             optimizer,
             lr_scheduler,
-            samples_per_question=256, 
+            samples_per_question=128, 
             kl_coeff=0.001,
             accelerator=accelerator,
             num_iterations=1000000,
@@ -462,9 +438,11 @@ if __name__ == "__main__":
 
 '''
 # set -x log_dir /new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter
-set -x log_dir /new_data/experiments_rh/deepscaler_replica_no_modification
+set -x log_dir /new_data/experiments_rh/deepscaler_no_insert_qwen1.5b_base
+set -x log_dir /new_data/experiments_rh/deepscaler_with_inserts_qwen1.5b_base
 mkdir -p $log_dir
 CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2  trainer_core.py \
+     --insert_reasoning_phrases \
      --output_dir $log_dir 2>&1 \
     | tee $log_dir/train.log
 # torchrun --nproc_per_node=4 trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
