@@ -114,35 +114,22 @@ class VerifierPool:
         self.global_num_verifiers = global_num_verifiers
         self.write_failed = write_failed
         self.lock = asyncio.Lock()
-        # Split the global verifiers between mathd and sympy
-        n_mathd = global_num_verifiers // 2
-        n_sympy = global_num_verifiers - n_mathd
-        self.verifier_pool_mathd = [None for _ in range(n_mathd)]
-        self.verifier_load_mathd = [0 for _ in range(n_mathd)]
-        self.verifier_pool_sympy = [None for _ in range(n_sympy)]
-        self.verifier_load_sympy = [0 for _ in range(n_sympy)]
-        self.create_verifier_tasks = ([asyncio.create_task(self.create_verifier_mathd(i)) for i in range(n_mathd)] +
-                                       [asyncio.create_task(self.create_verifier_sympy(i)) for i in range(n_sympy)])
-        self.time_since_last_failed = time.time()
+        # Create an asyncio.Queue to hold available workers.
+        self.verifier_queue = asyncio.Queue()
+        for _ in range(global_num_verifiers):
+            self.create_verifier_worker()
         self.outfile = Path(output_dir) / "failed_samples_verify.jsonl" if output_dir is not None else Path("failed_samples_verify.jsonl")
         self.outfile.unlink(missing_ok=True)
-        Path(str(self.outfile)+'.lock').unlink(missing_ok=True)
+        Path(str(self.outfile) + '.lock').unlink(missing_ok=True)
         
-    async def create_verifier_mathd(self, index: int):
-        async with self.lock:
-            self.verifier_pool_mathd[index] = VerifierWorker.options(
-                num_cpus=1, 
-                scheduling_strategy="SPREAD",
-            ).remote(f"verifier_mathd_{index}_{str(uuid.uuid4())}")
-            self.verifier_load_mathd[index] = 0
-
-    async def create_verifier_sympy(self, index: int):
-        async with self.lock:
-            self.verifier_pool_sympy[index] = VerifierWorker.options(
-                num_cpus=1, 
-                scheduling_strategy="SPREAD",
-            ).remote(f"verifier_sympy_{index}_{str(uuid.uuid4())}")
-            self.verifier_load_sympy[index] = 0
+    def create_verifier_worker(self):
+        # Create a new worker instance.
+        worker = VerifierWorker.options(
+            num_cpus=1, 
+            scheduling_strategy="SPREAD"
+        ).remote(f"verifier_worker_{str(uuid.uuid4())}")
+        self.verifier_queue.put_nowait(worker)
+        return worker
 
     async def write_failed_sample(self, sample: dict):
         print("\033[38;5;196m\033[1m DEBUG: Failed to verify sample \033[0m", flush=True)
@@ -156,34 +143,19 @@ class VerifierPool:
         return sample
     
     async def _verify_single(self, sample: dict, mode: str, **kwargs) -> dict:
-        result = sample
-        for _ in range(2):
-            try:
-                if mode == 'mathd':
-                    async with self.lock:
-                        min_index = min(range(len(self.verifier_load_mathd)), key=lambda i: self.verifier_load_mathd[i])
-                        self.verifier_load_mathd[min_index] += 1
-                    result_ref = self.verifier_pool_mathd[min_index].verify_mathd.remote(sample, kwargs['max_gen_length'])
-                    result = await asyncio.wait_for(result_ref, 30)
-                    async with self.lock:
-                        self.verifier_load_mathd[min_index] -= 1
-                elif mode == 'sympy':
-                    async with self.lock:
-                        min_index = min(range(len(self.verifier_load_sympy)), key=lambda i: self.verifier_load_sympy[i])
-                        self.verifier_load_sympy[min_index] += 1
-                    result_ref = self.verifier_pool_sympy[min_index].verify_sympy.remote(sample, kwargs['max_gen_length'])
-                    result = await asyncio.wait_for(result_ref, 30)
-                    async with self.lock:
-                        self.verifier_load_sympy[min_index] -= 1
-                else:
-                    raise ValueError(f"Invalid mode: {mode}")
-                # break
-            except Exception as e:
-                if mode == 'mathd':
-                    await self.create_verifier_mathd(min_index)
-                else:
-                    await self.create_verifier_sympy(min_index)
-                await asyncio.sleep(random.uniform(0.01, 0.05))
+        # Get a worker from the queue. If none available, create one.
+        worker = await self.verifier_queue.get()
+        try:
+            # Dynamically call the required verification method.
+            method = getattr(worker, f"verify_{mode}")
+            result_ref = method.remote(sample, kwargs['max_gen_length'])
+            result = await asyncio.wait_for(result_ref, 30)
+        except Exception as e:
+            # Replace the worker on failure.
+            ray.kill(worker)
+            self.create_verifier_worker()
+            raise e
+        self.verifier_queue.put_nowait(worker)
         return result
     
     async def pick_verified_sample(self, results: list[dict]) -> dict:
@@ -194,7 +166,6 @@ class VerifierPool:
         for result in results:
             if result['parsed_attempt'] != '':
                 return result
-        await self.write_failed_sample(results[0])
         return results[0]
 
     async def verify_balanced(self, sample: dict, **kwargs) -> dict:
@@ -202,10 +173,22 @@ class VerifierPool:
         sample['original_reward'] = 0.0
         sample['reward'] = 0.0
         sample['parsed_attempt'] = ''
-        tasks = [asyncio.create_task(self._verify_single(deepcopy(sample), 'mathd', **kwargs)),
-                 asyncio.create_task(self._verify_single(deepcopy(sample), 'sympy', **kwargs))]
-        results = await asyncio.gather(*tasks)
-        return await self.pick_verified_sample(results)
+        tasks = [
+            asyncio.create_task(self._verify_single(deepcopy(sample), 'mathd', **kwargs)),
+            asyncio.create_task(self._verify_single(deepcopy(sample), 'sympy', **kwargs))
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        valid_results = []
+        for res in results:
+            if isinstance(res, Exception):
+                continue
+            valid_results.append(res)
+        if not valid_results:
+            await self.write_failed_sample(sample)
+            return sample
+        
+        return await self.pick_verified_sample(valid_results)
 
 
 def get_or_create_verifier_pool(global_num_verifiers: int, write_failed: bool = False) -> VerifierPool:
