@@ -138,7 +138,8 @@ class BaseVLLMWorker:
     
     def setup_registration(self):
         try:
-            last_weights = ray.get(self.registry.get_last_weights.remote())
+            #double dereference since the returned value is an object storage reference from ray.put
+            last_weights = ray.get(ray.get(self.registry.get_last_weights.remote()))
             if last_weights is not None:
                 self.update_weights(last_weights)
             ray.get(self.registry.register.remote(service_id=self.worker_id))

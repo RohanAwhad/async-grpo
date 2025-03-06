@@ -203,8 +203,6 @@ async def train(args,
     total_samples_accumulated = 0
     last_saved_samples = 0
     batch_totals = BatchMetrics()
-    # actor_registry = ray.get_actor("generation_vllm_registry")
-    # reference_registry = ray.get_actor("logprob_vllm_registry")
     
     # Outermost loop: Policy iteration
     for iteration in range(num_iterations):
@@ -429,7 +427,7 @@ if __name__ == "__main__":
             model, 
             optimizer,
             lr_scheduler,
-            samples_per_question=64, 
+            samples_per_question=8, 
             kl_coeff=0.001,
             accelerator=accelerator,
             num_iterations=1000000,
@@ -444,6 +442,7 @@ set -x log_dir /new_data/experiments_rh/deepscaler_no_insert_qwen1.5b_base
 set -x log_dir /new_data/experiments_rh/deepscaler_with_inserts_qwen1.5b_base
 set -x log_dir /new_data/experiments_rh/deepscaler_no_inserts_qwen1.5b_base_5e-6
 set -x log_dir /new_data/experiments_rh/qwen1.5b_limo_s3143_deepscaler_64spq
+set -x log_dir /new_data/experiments_rh/testing_vllm_failures
 mkdir -p $log_dir
 CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2  trainer_core.py \
      --output_dir $log_dir 2>&1 \
