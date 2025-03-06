@@ -108,6 +108,7 @@ def update_vllm_worker_weights(model, accelerator, registry_actor_names=["refere
         for registry_actor_name in registry_actor_names:
             # Get the registry actor which maintains the inference actors.
             registry = ray.get_actor(registry_actor_name)
+            tasks.append(registry.update_weights.remote(new_state_dict=state_ref))
             replica_handles = ray.get(registry.get_actors.remote())
             tasks.extend([handle.update_weights.remote(new_state_dict=state_ref)
                         for handle in replica_handles])
@@ -321,7 +322,7 @@ if __name__ == "__main__":
     # Training Parameters
     parser.add_argument(
         "--learning_rate",
-        default=1.5e-5,
+        default=5e-6,
         type=float,
         # required=True,
         help="Learning rate for training."
@@ -428,7 +429,7 @@ if __name__ == "__main__":
             model, 
             optimizer,
             lr_scheduler,
-            samples_per_question=128, 
+            samples_per_question=64, 
             kl_coeff=0.001,
             accelerator=accelerator,
             num_iterations=1000000,
@@ -439,10 +440,12 @@ if __name__ == "__main__":
 '''
 # set -x log_dir /new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter
 set -x log_dir /new_data/experiments_rh/deepscaler_no_insert_qwen1.5b_base
+     --insert_reasoning_phrases \
 set -x log_dir /new_data/experiments_rh/deepscaler_with_inserts_qwen1.5b_base
+set -x log_dir /new_data/experiments_rh/deepscaler_no_inserts_qwen1.5b_base_5e-6
+set -x log_dir /new_data/experiments_rh/qwen1.5b_limo_s3143_deepscaler_64spq
 mkdir -p $log_dir
 CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2  trainer_core.py \
-     --insert_reasoning_phrases \
      --output_dir $log_dir 2>&1 \
     | tee $log_dir/train.log
 # torchrun --nproc_per_node=4 trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log

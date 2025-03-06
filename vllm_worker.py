@@ -3,6 +3,7 @@ from copy import deepcopy
 from functools import partial
 from hashlib import sha256
 import json
+import os
 import random
 import logging
 import time
@@ -131,24 +132,19 @@ class BaseVLLMWorker:
         self.engine_args = self.get_engine_args(model_path, tensor_parallel_size, max_num_seqs)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.llm = AsyncLLMEngine.from_engine_args(self.engine_args)
-        atexit.register(lambda: asyncio.get_event_loop().create_task(self._async_cleanup()))
     
     def get_engine_args(self, model_path: str, tensor_parallel_size: int, max_num_seqs: int) -> AsyncEngineArgs:
         raise NotImplementedError("Subclasses must implement get_engine_args method.")
     
     def setup_registration(self):
         try:
+            last_weights = ray.get(self.registry.get_last_weights.remote())
+            if last_weights is not None:
+                self.update_weights(last_weights)
             ray.get(self.registry.register.remote(service_id=self.worker_id))
             print(f"Worker {self.worker_id} registered.")
         except Exception as e:
             print(f"Error during registration for worker {self.worker_id}: {e}")
-    
-    async def _async_cleanup(self):
-        try:
-            await self.registry.deregister.remote(service_id=self.worker_id)
-            print(f"Worker {self.worker_id} deregistered successfully.")
-        except Exception as e:
-            print(f"Error during async cleanup of worker {self.worker_id}: {e}")
     
     def update_weights(self, new_state_dict: dict):
         llm_model = self.llm.engine.model_executor.driver_worker.model_runner.model
@@ -188,6 +184,7 @@ class BaseVLLMWorker:
             print(f"\033[38;5;196m\033[1mError during inference for worker {self.worker_id}: {e}\033[0m")
             import traceback
             traceback.print_exc()
+            os._exit(1)
             raise e
 
 @ray.remote
