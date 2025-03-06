@@ -154,6 +154,8 @@ class VerifierPool:
             # Replace the worker on failure.
             ray.kill(worker)
             self.create_verifier_worker()
+            # import traceback
+            # traceback.print_exc()
             raise e
         self.verifier_queue.put_nowait(worker)
         return result

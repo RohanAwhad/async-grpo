@@ -211,16 +211,18 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             max_model_len=config.max_position_embeddings,
         )
     
-    def get_gen_kwargs(self, sample: dict, **kwargs) -> dict:
-        max_tokens = kwargs.get("max_tokens", self.engine_args.max_model_len)
+    def get_max_tokens(self, sample: dict, max_tokens=None) -> int:
+        max_tokens = max_tokens if max_tokens is not None else self.engine_args.max_model_len
         max_tokens = max_tokens - len(sample['input_token_ids']) - 1
         if max_tokens <= 0:
             max_tokens = 1
             print(f"\033[1;38;2;255;165;0mMax tokens is less than 0 for sample: \033[0m {sample['input']}")
-
+        return max_tokens
+    
+    def get_gen_kwargs(self, sample: dict, **kwargs) -> dict:
         return {
             "n": kwargs.get("n", 1),
-            "max_tokens": max_tokens,
+            "max_tokens": self.get_max_tokens(sample, kwargs.get("max_tokens", self.engine_args.max_model_len)),
             "temperature": kwargs.get("temperature", 0.7),
             "include_stop_str_in_output": kwargs.get("include_stop_str_in_output", True),
             "spaces_between_special_tokens": False,
@@ -248,7 +250,12 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             sample['sample_text'] = self.tokenizer.decode(sample['sample_ids'])
             sample['sample_position_ids'] = list(range(len(sample['sample_ids'])))
             # Use the remote call because verifier_pool is now a ray actor
-            sample_rewards_futures.append(self.verifier_pool.verify_balanced.remote(sample))
+            sample_rewards_futures.append(
+                self.verifier_pool.verify_balanced.remote(
+                    sample,
+                    max_gen_length=kwargs.get("max_tokens", self.engine_args.max_model_len)
+                )
+            )
         logging.debug(f"\033[1;38;2;255;165;0mFirst sample before rewriting: \033[0m {samples[0]['sample_text']}")
 
         if insert_reasoning_phrases:
@@ -270,7 +277,12 @@ class GenerationVLLMWorker(BaseVLLMWorker):
                 modified_sample['output_len'] = len(modified_sample['output_token_ids'])
                 modified_sample['sample_text'] = self.tokenizer.decode(modified_sample['sample_ids'])
                 modified_sample['sample_position_ids'] = list(range(len(modified_sample['sample_ids'])))
-                modified_rewards_futures.append(self.verifier_pool.verify_balanced.remote(modified_sample))
+                modified_rewards_futures.append(
+                    self.verifier_pool.verify_balanced.remote(
+                        modified_sample,
+                        max_gen_length=kwargs.get("max_tokens", self.engine_args.max_model_len)
+                    )
+                )
             logging.debug(f"\033[1;38;2;255;165;0mFirst sample after generating with rewritten input: \033[0m {modified_samples[0]['sample_text']}")
             modified_results = await asyncio.gather(*modified_rewards_futures)
             for s in modified_results:
