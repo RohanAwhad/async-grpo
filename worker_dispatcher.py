@@ -2,6 +2,8 @@
 The purpose of this dispatcher is to handle conflicting environments between training and vllm environments. 
 Ray has an environment management that onle installs pip packages on top of the base environment. 
 So having different requirements.txt was the only way to figure this out.
+
+It also holds strong references to the registries and workers so ray doesn't garbage collect them.
 '''
 
 import argparse
@@ -10,8 +12,25 @@ import time
 import uuid
 import ray
 
+from verifier_pool import get_or_create_verifier_pool
+from vllm_registry import get_or_create_registry
+
+
+def get_runtime_env(mode: str):
+    runtime_env = {"env_vars": dict(os.environ)}
+    runtime_env["env_vars"].pop("CUDA_VISIBLE_DEVICES", None)
+    if mode == "generation":
+        runtime_env["pip"] = [
+            f"-r {os.path.join(os.path.dirname(__file__), 'requirements_vllm.txt')}",   
+            "math-verify[antlr4_13_2]"
+        ]
+        runtime_env["excludes"] = ["*.pyc", "__pycache__"]
+    elif mode == "logprob":
+        runtime_env["pip"] = [f"-r {os.path.join(os.path.dirname(__file__), 'requirements_fsdp.txt')}"]
+    return runtime_env
+
 @ray.remote
-def create_worker(mode: str, model_path: str, tensor_parallel_size: int, max_num_seqs: int,
+def create_worker(mode: str, model_path: str, tensor_parallel_size: int=1, max_num_seqs: int=1,
                     global_num_verifiers: int = 100, max_tokens_per_gpu: int = 23000,
                     write_failed_generation_samples: bool = False):
     """
@@ -25,6 +44,7 @@ def create_worker(mode: str, model_path: str, tensor_parallel_size: int, max_num
             name=service_id,
             num_gpus=tensor_parallel_size,
             num_cpus=1,
+            max_restarts=-1,
         ).remote(
             model_path=model_path,
             worker_id=service_id,
@@ -39,7 +59,7 @@ def create_worker(mode: str, model_path: str, tensor_parallel_size: int, max_num
         worker = LogprobWorker.options(
             name=service_id,
             num_gpus=1,
-            num_cpus=2,
+            num_cpus=4,
         ).remote(
             model_path=model_path,
             worker_id=service_id,
@@ -48,6 +68,7 @@ def create_worker(mode: str, model_path: str, tensor_parallel_size: int, max_num
     else:
         raise ValueError(f"Invalid mode: {mode}")
     return worker
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -62,7 +83,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, required=True,
                         choices=["generation", "logprob"],
                         help="Worker mode: generation or logprob")
-    parser.add_argument("--max_tokens_per_gpu", type=int, default=23000,
+    parser.add_argument("--max_tokens_per_gpu", type=int, default=46000,
                         help="Maximum tokens per GPU for logprob worker")
     parser.add_argument("--global_num_verifiers", type=int, default=100,
                         help="Number of verifier workers for the global verifier pool")
@@ -72,20 +93,16 @@ if __name__ == "__main__":
 
     # Initialize Ray.
     ray.init(address="auto", namespace="test")
+    registry_name = "generation_vllm_registry" if args.mode == "generation" else "logprob_vllm_registry"
+    registry = get_or_create_registry(registry_name)
+
+    verifier_pool = None
+    if args.mode == "generation":
+        verifier_pool = get_or_create_verifier_pool(args.global_num_verifiers)
 
     print(f"Launching {args.mode} worker ...")
     
-    runtime_env = {"env_vars": dict(os.environ)}
-    runtime_env["env_vars"].pop("CUDA_VISIBLE_DEVICES", None)
-    if args.mode == "generation":
-        runtime_env["pip"] = [
-            f"-r {os.path.join(os.path.dirname(__file__), 'requirements_vllm.txt')}",   
-            "math-verify[antlr4_13_2]"
-        ]
-        runtime_env["excludes"] = ["*.pyc", "__pycache__"]
-    elif args.mode == "logprob":
-        runtime_env["pip"] = [f"-r {os.path.join(os.path.dirname(__file__), 'requirements_fsdp.txt')}"]
-
+    runtime_env = get_runtime_env(args.mode)
     # Create the remote factory with the proper runtime_env so that its remote methods
     # execute in the customized environment.
     # factory = WorkerFactory.options(runtime_env=runtime_env).remote()
@@ -98,30 +115,20 @@ if __name__ == "__main__":
         global_num_verifiers=args.global_num_verifiers,
         write_failed_generation_samples=args.write_failed_generation_samples
     ))
-    # del factory
+
+    print(f"Worker {worker} created.")
 
     # Wait for the appropriate registry to be available before moving on.
-    registry_name = "generation_vllm_registry" if args.mode == "generation" else "logprob_vllm_registry"
-    print(f"Waiting for registry {registry_name} to be available...")
-    while True:
-        try:
-            ray.get_actor(registry_name)
-            print(f"Registry {registry_name} found.")
-            break
-        except Exception:
-            print(f"Registry {registry_name} not available, sleeping for 5 second...")
-            time.sleep(5)
-
-    while True:
-        try:
-            ray.get_actor("generation_vllm_registry")
-            ray.get_actor("logprob_vllm_registry")
-            print("logprob_vllm_registry found.")
-            break
-        except Exception:
-            print("logprob_vllm_registry not found, sleeping for 2 seconds...")
-            time.sleep(2)
-    
+    # registry = None
+    # print(f"Waiting for registry {registry_name} to be available...")
+    # while True:
+    #     try:
+    #         registry = ray.get_actor(registry_name)
+    #         print(f"Registry {registry_name} found.")
+    #         break
+    #     except Exception:
+    #         print(f"Registry {registry_name} not available, sleeping for 5 second...")
+    #         time.sleep(5)
     
 
     # Keep the process alive (so that the worker remains registered).
@@ -134,22 +141,52 @@ if __name__ == "__main__":
 '''
 mamba activate ray
 set model /dev/shm/qwen7b-math-base
-for i in (seq 0 7)
-    if test $i -lt 7
+ray stop; rm -rf /dev/shm/ray; ray start --head --temp-dir /dev/shm/ray/
+ray stop; rm -rf /dev/shm/ray; ray start --address=10.241.128.17:6379
+rclone copy --copy-links /new_data/aldo/models/qwen7b-math-base/ /dev/shm/qwen7b-math-base/
+            --model_path /dev/shm/qwen-2.5-3b-instruct \
+
+sudo ulimit -n 100000
+ulimit -n 100000
+rclone copy --copy-links /new_data/aldo/models/qwen-2.5-3b-instruct /dev/shm/qwen-2.5-3b-instruct
+set -x log_dir /new_data/experiments_rh/countdown_3b_qwen_grpo_v2
+set -x log_dir /new_data/experiments_rh/countdown_3b_qwen_grpo_100steps_ref_update
+set -x log_dir /new_data/experiments_rh/countdown_3b_qwen_grpo_64_samples_per_question
+set -x model_path "/dev/shm/DeepSeek-R1-Distill-Qwen-1.5B"
+rclone copy --copy-links /new_data/aldo/models/Qwen2.5-1.5B-Instruct/ /dev/shm/Qwen2.5-1.5B-Instruct
+rclone copy --copy-links /new_data/aldo/models/Qwen2.5-1.5B/ /dev/shm/Qwen2.5-1.5B
+set -x model_path "/dev/shm/qwen1.5b_limo_insertions_s3143/"
+set -x log_dir /new_data/experiments_rh/qwen1.5b_limo_s3143_deepscaler_64spq
+set -x log_dir /new_data/experiments_rh/testing_vllm_failures
+mv /new_data/experiments_rh/testing_vllm_failures /new_data/experiments_rh/qwen_base_1.5_deepscaler_128bs_16spq
+set -x log_dir /new_data/experiments_rh/phi-4-limo-chat-insertions/evals/
+
+rclone copy --copy-links /new_data/experiments_rh/phi-4-limo-chat-insertions/hf_format/samples_11901/ /dev/shm/phi-4-limo-chat-insertions-s11901
+rclone copy --copy-links /new_data/experiments_rh/phi-4-limo-chat-insertions/hf_format/samples_17850 /dev/shm/phi-4-limo-chat-insertions-s17850
+set -x model_path "/dev/shm/phi-4-limo-chat-insertions-s17850"
+set -x model_path "/dev/shm/phi-4-limo-chat-insertions-s11901"
+
+set -x model_path "/dev/shm/Qwen2.5-1.5B-Instruct"
+set -x log_dir /new_data/experiments_rh/qwen_base_1.5_deepscaler_128bs_64spq
+mkdir -p $log_dir
+cd /new_data/aldo/v1_reasoning/grpo_feb_24th/
+for i in (seq 0 5)
+    if test $i -lt 5
         echo "Launching generation worker on GPU $i..."
         python worker_dispatcher.py \
-            --model_path /dev/shm/qwen7b-math-base \
+            --model_path $model_path \
             --mode generation \
             --tensor_parallel_size 1 \
-            --max_num_seqs 128 \
+            --max_num_seqs 64 \
             --write_failed_generation_samples \
-            --global_num_verifiers 100 | tee generation_worker_$i.log &
+            --global_num_verifiers 50 2>&1 | tee $log_dir/generation_worker_$i.log &
     else
         # CUDA_VISIBLE_DEVICES="$i" python logprob_worker.py --model_path /dev/shm/phi-4 &
         echo "Launching logprob worker on GPU $i..."
         torchrun --nproc_per_node=1 --master_port=1234$i worker_dispatcher.py \
-            --model_path /dev/shm/qwen7b-math-base \
-            --mode logprob | tee logprob_worker_$i.log &
+            --model_path $model_path \
+            --mode logprob \
+            --max_tokens_per_gpu 36000 2>&1 | tee $log_dir/logprob_worker_$i.log &
     end
 end
 

@@ -125,20 +125,22 @@ class BaseVLLMWorker:
     """
     def __init__(self, model_path: str, worker_id: str,
                  tensor_parallel_size: int = 1, max_num_seqs: int = 16):
+        self.counter = 0
         self.model_path = model_path
         self.worker_id = worker_id
-        self.counter = 0
         print(f"Initializing {self.__class__.__name__} with model path: {model_path}")
         self.engine_args = self.get_engine_args(model_path, tensor_parallel_size, max_num_seqs)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.llm = AsyncLLMEngine.from_engine_args(self.engine_args)
+        self.llm = AsyncLLMEngine.from_engine_args(self.engine_args, start_engine_loop=True)
+        self.registry = get_or_create_registry("generation_vllm_registry")
+        self.setup_registration()
     
     def get_engine_args(self, model_path: str, tensor_parallel_size: int, max_num_seqs: int) -> AsyncEngineArgs:
         raise NotImplementedError("Subclasses must implement get_engine_args method.")
     
     def setup_registration(self):
         try:
-            #double dereference since the returned value is an object storage reference from ray.put
+            '''double dereference since the returned value is an object storage reference from ray.put'''
             last_weights = ray.get(ray.get(self.registry.get_last_weights.remote()))
             if last_weights is not None:
                 self.update_weights(last_weights)
@@ -149,14 +151,11 @@ class BaseVLLMWorker:
     
     def update_weights(self, new_state_dict: dict):
         llm_model = self.llm.engine.model_executor.driver_worker.model_runner.model
-        # for k,v in new_state_dict.items():
-        #     v = v.to("cuda")
-        #     llm_model.load_weights({k: v}.items())
         llm_model.load_weights(new_state_dict.items())
         print(f"vLLM weights updated successfully on service {self.worker_id}.")
         return True
     
-    async def inference(self, input_data: dict, **kwargs) -> list[dict]:
+    async def inference(self, sample: dict, **kwargs) -> list[dict]:
         """
         Base inference:
           - Input: input_data must include 'input_token_ids'.
@@ -164,7 +163,7 @@ class BaseVLLMWorker:
           - Constructs a SamplingParams object and then performs inference.
         """
         try:
-            input_ids = input_data['input_token_ids']
+            input_ids = sample['input_token_ids']
             sampling_params = SamplingParams(
                 **kwargs
             )
@@ -185,7 +184,6 @@ class BaseVLLMWorker:
             print(f"\033[38;5;196m\033[1mError during inference for worker {self.worker_id}: {e}\033[0m")
             import traceback
             traceback.print_exc()
-            os._exit(1)
             raise e
 
 @ray.remote
@@ -195,8 +193,6 @@ class GenerationVLLMWorker(BaseVLLMWorker):
         # Pass the common parameters to the base initializer.
         self.verifier_pool = get_or_create_verifier_pool(global_num_verifiers, write_failed)
         super().__init__(model_path, worker_id, tensor_parallel_size, max_num_seqs)
-        self.registry = get_or_create_registry("generation_vllm_registry")
-        self.setup_registration()
     
     def get_engine_args(self, model_path: str, tensor_parallel_size: int, max_num_seqs: int) -> AsyncEngineArgs:
         from transformers import AutoConfig
@@ -209,6 +205,8 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             enable_prefix_caching=True,
             max_num_seqs=max_num_seqs,
             max_model_len=config.max_position_embeddings,
+            disable_log_requests=True,
+            disable_log_stats=True,
         )
     
     def get_max_tokens(self, sample: dict, max_tokens=None) -> int:

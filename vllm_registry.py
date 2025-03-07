@@ -4,6 +4,11 @@ import ray
 import asyncio
 import time
 
+# Simple debug logger that writes to a file named debug.log
+def debug_log(message: str):
+    print(f"\033[1;38;2;57;255;20m{message}\033[0m")
+    with open("debug.log", "a") as f:
+        f.write(message + "\n")
 
 @ray.remote
 class VLLMRegistry:
@@ -18,20 +23,22 @@ class VLLMRegistry:
         async with self.balancer_lock:
             self.actors[service_id] = service_id
             self.balancer_lock.notify_all()
-            print("\033[1;38;2;57;255;20mActor registered! #########################################\033[0m")
             return f"{service_id} registered."
 
     async def deregister(self, service_id: str):
         async with self.balancer_lock:
-            self.actors.pop(service_id, None)
-            self.actor_current_load.pop(service_id, None)
-            print("\033[1;38;2;57;255;20mActor deregistered! #########################################\033[0m")
+            if service_id in self.actors:
+                actor_handle = ray.get_actor(service_id, namespace="test")
+                ray.kill(actor_handle, no_restart=False)
+                self.actors.pop(service_id, None)
+                self.actor_current_load.pop(service_id, None)
             return f"{service_id} deregistered."
     
     def get_last_weights(self):
         return self.last_weights
     
     def update_weights(self, new_state_dict: dict):
+        '''directly put the new state in ray object storage to decrease latency'''
         self.last_weights = ray.put(new_state_dict)
 
     def get_actors(self):
@@ -41,9 +48,10 @@ class VLLMRegistry:
         async with self.balancer_lock:
             # Wait until there is an actor available
             while len(self.actors) == 0:
-                print("\033[1;38;2;57;255;20mWaiting for actor to be available #########################################\033[0m")
+                '''If no actor is available, wait until an actor is registered
+                   Note that the balancer_lock is released when waiting on the condition variable'''
                 await self.balancer_lock.wait()
-                print("\033[1;38;2;57;255;20mActor available!!!!! #########################################\033[0m")
+                    
             chosen_server = min(self.actors.keys(), key=lambda s: self.actor_current_load[s])
             self.actor_current_load[chosen_server] += num_requests
             return chosen_server
@@ -53,18 +61,26 @@ class VLLMRegistry:
             self.actor_current_load[service_id] -= num_requests
 
     async def inference_balanced(self, 
-                                 input_data: dict, 
+                                 sample: dict, 
                                  **kwargs) -> list[dict]:
         n = kwargs.get("n", 1)
-        for _ in range(3):
+        while True:
             chosen_service_id = await self.acquire_actor(n)
             try:
                 actor = ray.get_actor(self.actors[chosen_service_id], namespace="test")
-                result = await actor.inference.remote(input_data, **kwargs)
+                result = await actor.inference.remote(sample=sample, **kwargs)
                 await self.release_actor(chosen_service_id, n)
                 return result
+            except ray.exceptions.ActorUnavailableError:
+                '''Doing this to avoid restarting the failing actor immediately after it's registered
+                   Ray needs some time to make the actor available'''
+                await self.release_actor(chosen_service_id, n)
+                await asyncio.sleep(1)
             except Exception as e:
+                import traceback
+                debug_log("Exception during inference_balanced: " + traceback.format_exc())
                 await self.deregister(chosen_service_id)
+                await asyncio.sleep(1)
                 # raise e
         raise Exception("All actors failed.")
 

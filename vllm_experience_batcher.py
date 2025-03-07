@@ -7,9 +7,9 @@ import ray
 import re
 import random
 
-async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_name, reference_registry_name, temperature=1.0, max_tokens=8192, insert_reasoning_phrases=False):
-    actor_registry = ray.get_actor(actor_registry_name)
-    samples = await actor_registry.inference_balanced.remote(
+async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_handle, reference_registry_handle, temperature=1.0, max_tokens=8192, insert_reasoning_phrases=False):
+    # actor_registry = ray.get_actor(actor_registry_name)
+    samples = await actor_registry_handle.inference_balanced.remote(
         sample,
         n=num_samples,
         temperature=temperature,
@@ -25,9 +25,9 @@ async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_na
     #     for s in samples])
     
     # logging.debug(f"\033[1;38;2;255;165;0mFirst sample after rewriting: \033[0m {samples[0]['sample_text']}")
-    reference_registry = ray.get_actor(reference_registry_name)
+    # reference_registry = ray.get_actor(reference_registry_name)
 
-    tasks = [reference_registry.inference_balanced.remote(
+    tasks = [reference_registry_handle.inference_balanced.remote(
         s,
     ) for s in samples]
     samples_with_ref_logprobs = await asyncio.gather(*tasks)
@@ -41,6 +41,8 @@ class ExperienceBatcher:
         self.training_batches_lengths = {}
         self.experience_queue = []
         self.ready_experience_samples = []
+        self.actor_registry_handle = ray.get_actor("generation_vllm_registry")
+        self.reference_registry_handle = ray.get_actor("logprob_vllm_registry")
         self.lock = asyncio.Lock()
     
     def start_creating_batches(self):
@@ -146,8 +148,8 @@ class ExperienceBatcher:
             get_experience_and_ref_logprobs(
                 sample,
                 samples_per_question,
-                actor_registry,
-                reference_registry,
+                self.actor_registry_handle,
+                self.reference_registry_handle,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 insert_reasoning_phrases=insert_reasoning_phrases
