@@ -8,7 +8,7 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from functools import partial
 
 from utils import log_rank_0
-from grpo_loss import PerTokenLogProbsFromCE
+from grpo_loss import PerTokenLogProbsFromCE, make_grpo_forward
 
 def get_module_class_from_name(
     model: torch.nn.Module, name: str
@@ -112,6 +112,7 @@ def setup_model(args, model=None):
     if model is None:
         model = AutoModelForCausalLM.from_pretrained(**base_model_args)
     model = align_model_and_tokenizer(model, tokenizer)
+    model = make_grpo_forward(model, args.loss_chunksize)
     model.loss_function = PerTokenLogProbsFromCE
 
     if model.__class__.__name__ not in [

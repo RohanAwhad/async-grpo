@@ -165,9 +165,10 @@ rclone copy --copy-links /new_data/experiments_rh/phi-4-limo-chat-insertions/hf_
 rclone copy --copy-links /new_data/experiments_rh/phi-4-limo-chat-insertions/hf_format/samples_17850 /dev/shm/phi-4-limo-chat-insertions-s17850
 set -x model_path "/dev/shm/phi-4-limo-chat-insertions-s17850"
 set -x model_path "/dev/shm/phi-4-limo-chat-insertions-s11901"
+set -x log_dir /new_data/experiments_rh/eval_qwen_1.5b_aime
 
-set -x model_path "/dev/shm/Qwen2.5-1.5B-Instruct"
-set -x log_dir /new_data/experiments_rh/qwen_base_1.5_deepscaler_128bs_64spq
+set -x model_path "/dev/shm/DeepSeek-R1-Distill-Qwen-1.5B"
+set -x log_dir /new_data/experiments_rh/qwen_1.5b_r1_distill_deepscaler_test
 mkdir -p $log_dir
 cd /new_data/aldo/v1_reasoning/grpo_feb_24th/
 for i in (seq 0 5)

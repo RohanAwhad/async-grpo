@@ -143,7 +143,7 @@ async def remote_queue_batch_generator(global_rank: int,
             break
         yield post_process_batch(batch, device)
 
-def scale_model_gradients(model, total_samples_in_batch):
+def scale_model_gradients(model, total_samples_in_batch, num_samples_per_question):
     """
     Scale gradients for every parameter in the model by world_size/total_samples_in_batch.
     It's necessary to scale by world_size because fsdp takes the mean of the gradients across the world_size.
@@ -152,14 +152,15 @@ def scale_model_gradients(model, total_samples_in_batch):
         model: The torch model whose gradients should be scaled.
         total_samples_in_batch: The number of samples in the batch.
     """
+    # the more samples per question, 
     scale_factor = 1.0 / total_samples_in_batch
     for param in model.parameters():
         if param.grad is not None:
             param.grad.mul_(scale_factor)
 
-def take_gradient_step(model, optimizer, lr_scheduler, accelerator, total_samples_accumulated):
+def take_gradient_step(model, optimizer, lr_scheduler, accelerator, total_samples_accumulated, num_samples_per_question):
     """Scales gradients, applies clipping, and takes an optimization step."""
-    scale_model_gradients(model, total_samples_accumulated)
+    scale_model_gradients(model, total_samples_accumulated, num_samples_per_question)
     grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
     print(f"\033[1;38;2;255;165;0mGlobal Grad Norm:\033[0m {grad_norm} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}")
     optimizer.step()
@@ -268,7 +269,7 @@ async def train(args,
             bm = batch_totals.totals
             batch_num_samples = bm["samples"]
             total_samples_accumulated += batch_num_samples
-            grad_norm = take_gradient_step(model, optimizer, lr_scheduler, accelerator, batch_num_samples)
+            grad_norm = take_gradient_step(model, optimizer, lr_scheduler, accelerator, batch_num_samples, samples_per_question)
 
             if accelerator.is_main_process:
                 print(
@@ -309,7 +310,8 @@ if __name__ == "__main__":
         # default="/dev/shm/qwen7b-math-base",
         # default="/dev/shm/qwen-2.5-3b-instruct",
         # default="/dev/shm/Qwen2.5-1.5B-Instruct",
-        default="/dev/shm/Qwen2.5-1.5B",
+        # default="/dev/shm/Qwen2.5-1.5B",
+        default="/dev/shm/DeepSeek-R1-Distill-Qwen-1.5B",
         # default="Qwen/Qwen2.5-Math-7B",
         # default="/dev/shm/phi-4",
         type=str,
@@ -329,7 +331,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=32, #TODO: change to 32 for a real experiment
+        default=128, #TODO: change to 32 for a real experiment
         help="Global batch size of questions per gradient step. The batch will be split among GPUs even if not divisible by the number of GPUs."
     )
 
@@ -369,18 +371,25 @@ if __name__ == "__main__":
         help="Maximum number of tokens per GPU."
     )
 
+    parser.add_argument(
+        "--loss_chunksize",
+        type=int,
+        default=512,
+        help="Number of tokens to process at a time for the loss computation. This avoids creating the logits matrix all at once in memory (sequence length x vocab size) which creates a really large memory spike. None means no chunking."
+    )
+
     # Added new argument for temperature with a default value of 1.0
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
+        default=0.6,
         help="Sampling temperature for generating experience."
     )
 
     parser.add_argument(
         "--max_generation_tokens",
         type=int,
-        default=4096,
+        default=8192,
         help="Maximum number of tokens to generate per rollout."
     )
 
@@ -427,7 +436,7 @@ if __name__ == "__main__":
             model, 
             optimizer,
             lr_scheduler,
-            samples_per_question=8, 
+            samples_per_question=16, 
             kl_coeff=0.001,
             accelerator=accelerator,
             num_iterations=1000000,
@@ -443,6 +452,10 @@ set -x log_dir /new_data/experiments_rh/deepscaler_with_inserts_qwen1.5b_base
 set -x log_dir /new_data/experiments_rh/deepscaler_no_inserts_qwen1.5b_base_5e-6
 set -x log_dir /new_data/experiments_rh/qwen1.5b_limo_s3143_deepscaler_64spq
 set -x log_dir /new_data/experiments_rh/testing_vllm_failures
+set -x log_dir /new_data/experiments_rh/qwen_base_1.5_deepscaler_128bs_64spq
+
+
+set -x log_dir /new_data/experiments_rh/qwen_1.5b_r1_distill_deepscaler_test
 mkdir -p $log_dir
 CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2  trainer_core.py \
      --output_dir $log_dir 2>&1 \

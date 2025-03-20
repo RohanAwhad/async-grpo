@@ -37,6 +37,7 @@ class LogprobWorker:
             model_name_or_path=model_path,
             worker_id=worker_id,
             fsdp_sharding_strategy="FULL_SHARD",
+            loss_chunksize=None,
         )
         self.worker_id = worker_id
         self.max_tokens_per_gpu = max_tokens_per_gpu

@@ -34,8 +34,14 @@ logging.getLogger().setLevel(logging.INFO)
 
 delimiter = '\n\n'
 # special_phrases = ['', 'The answer is \\boxed{', 'Let\'s doublecheck!', 'Alternatively']
-special_phrases = ['Let\'s try another method to solve the problem:', 'Now, let\'s think again:', 'Wait!', 'Let\'s doublecheck the work so far.', 'Alternatively', 
-                   'Let\'s look at it from a different perspective:']
+special_phrases = [
+    'Wait!',
+    # 'Let\'s try another method to solve the problem:',
+    # 'Now, let\'s think again:',
+    # 'Let\'s doublecheck the work so far.',
+    # 'Alternatively',
+    # 'Let\'s look at it from a different perspective:',
+]
 
 def get_indices_of_delimiter(response, delimiter):
     indices = []
@@ -205,8 +211,8 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             enable_prefix_caching=True,
             max_num_seqs=max_num_seqs,
             max_model_len=config.max_position_embeddings,
-            disable_log_requests=True,
-            disable_log_stats=True,
+            disable_log_requests=False,
+            disable_log_stats=False,
         )
     
     def get_max_tokens(self, sample: dict, max_tokens=None) -> int:

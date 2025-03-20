@@ -16,10 +16,6 @@ from deepscaler_math_utils import extract_answer, grade_answer_mathd, grade_answ
 from utils import patch_target_module
 from functools import partial
 patch_target_module("math_verify.utils.timeout", partial(timeout, use_signals=False))
-# Import verification functions from math_verify
-from math_verify import verify, parse
-from math_verify.parser import LatexExtractionConfig, NormalizationConfig
-import re
 
 import numpy as np
 logging.getLogger().setLevel(logging.DEBUG)
@@ -154,8 +150,8 @@ class VerifierPool:
             # Replace the worker on failure.
             ray.kill(worker)
             self.create_verifier_worker()
-            import traceback
-            traceback.print_exc()
+            # import traceback
+            # traceback.print_exc()
             raise e
         self.verifier_queue.put_nowait(worker)
         return result

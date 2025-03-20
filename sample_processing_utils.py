@@ -115,7 +115,8 @@ def post_process_batch(batched_questions, device):
         else:
             sample = random.choice(batched_questions)
         print(
-            f"\033[1;96;40mDecoded Sample:\033[0m {sample['sample_text'][:200]}\n ... \n{sample['sample_text'][-200:]}\n" +
+            # f"\033[1;96;40mDecoded Sample:\033[0m {sample['sample_text'][:500]}\n ... \n{sample['sample_text'][-4000:]}\n" +
+            f"\033[1;96;40mDecoded Sample:\033[0m {sample['sample_text']}\n" +
             f"\033[1;96;40mReward:\033[0m {sample['reward']}\n" +
             f"\033[1;96;40mGround Truth Answer:\033[0m {sample['answer']}\n" +
             (f"\033[1;96;40mParsed Ground Truth Answer:\033[0m {sample['parsed_gt_answer']}\n" if 'parsed_gt_answer' in sample else "") +

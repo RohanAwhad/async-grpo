@@ -1,50 +1,108 @@
 import os
 import torch
 torch.set_float32_matmul_precision('high')
-from typing import Tuple
-from transformers import AutoTokenizer, AutoModelForCausalLM
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-Math-7B")
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-7B")
-'''
-rclone copy --copy-links ~/.cache/huggingface/hub/models--Qwen--Qwen2.5-Math-7B/snapshots/b101308fe89651ea5ce025f25317fea6fc07e96e/ /new_data/aldo/models/Qwen2.5-Math-7B
-'''
+from typing import Optional, Tuple, Union, List
 import torch.nn as nn
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.processing_utils import Unpack
 
-# def _make_grpo_forward(model):
-#     def _forward(
-#             input_ids=None,
-#             attention_mask=None,
-#             position_ids=None,
-#             past_key_values=None,
-#             inputs_embeds=None,
-#             use_cache=None,
-#             output_attentions=None,
-#             output_hidden_states=None,
-#             return_dict=None,
-#             cache_position=None,
-#             _output_indices=None,
-#             **kwargs,
-#     ):
-#         outputs = model.model(
-#             input_ids=input_ids,
-#             attention_mask=attention_mask,
-#             position_ids=position_ids,
-#             past_key_values=past_key_values,
-#             inputs_embeds=inputs_embeds,
-#             use_cache=use_cache,
-#             output_attentions=output_attentions,
-#             output_hidden_states=output_hidden_states,
-#             return_dict=return_dict,
-#             cache_position=cache_position,
-#             **kwargs,
-#         )
-#         hidden_states = outputs[0]
-#         # logits = model.lm_head(hidden_states[:, _output_indices, :]).contiguous().float()
-#         logits = model.lm_head(hidden_states).contiguous().float()
-#         return logits
-#     model.__original_forward = model.forward
-#     model.forward = _forward
-#     return model
+def make_grpo_forward(model, loss_chunksize: int = None):
+    def _forward(
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        num_logits_to_keep: int = 0,
+        **kwargs,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else model.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else model.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else model.config.use_return_dict
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = model.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = outputs[0]
+
+        T = hidden_states.shape[1]
+
+        if loss_chunksize is None or labels is None:
+            loss_chunksize = 2**31 - 1  # max value for Python's int
+        else:
+            loss_chunksize = min(loss_chunksize, T)
+
+        total_loss = []
+
+        for i in range(0, T, loss_chunksize):
+            end_idx = min(i + loss_chunksize, T)
+            logits = model.lm_head(hidden_states[:, i:end_idx, :]).float()
+            loss = model.loss_function(logits=logits, labels=labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
+            total_loss.append(loss)
+
+        # torch.distributed.breakpoint()
+        return CausalLMOutputWithPast(
+            loss=torch.cat(total_loss, dim=0),
+            # logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+        
+    # def _forward(
+    #         input_ids=None,
+    #         attention_mask=None,
+    #         position_ids=None,
+    #         past_key_values=None,
+    #         inputs_embeds=None,
+    #         use_cache=None,
+    #         output_attentions=None,
+    #         output_hidden_states=None,
+    #         return_dict=None,
+    #         cache_position=None,
+    #         _output_indices=None,
+    #         **kwargs,
+    # ):
+    #     outputs = model.model(
+    #         input_ids=input_ids,
+    #         attention_mask=attention_mask,
+    #         position_ids=position_ids,
+    #         past_key_values=past_key_values,
+    #         inputs_embeds=inputs_embeds,
+    #         use_cache=use_cache,
+    #         output_attentions=output_attentions,
+    #         output_hidden_states=output_hidden_states,
+    #         return_dict=return_dict,
+    #         cache_position=cache_position,
+    #         **kwargs,
+    #     )
+    #     hidden_states = outputs[0]
+    #     # logits = model.lm_head(hidden_states[:, _output_indices, :]).contiguous().float()
+    #     logits = model.lm_head(hidden_states).contiguous().float()
+    #     return logits
+    model.__original_forward = model.forward
+    model.forward = _forward
+    return model
 
 # see transformers/loss/loss_utils.py:ForCausalLMLoss
 # coming from the fact that logprobs equivalent to -CrossEntropyLoss(logits, labels)
@@ -216,10 +274,11 @@ def compute_grpo_loss(
     
     # Combined loss
     loss = pg_loss + kl_coeff * kl_div
-    loss_metrics = get_mean_per_sample_loss(loss, output_lens_broadcasted, minibatch["num_samples"]).item()
-    pg_loss_metrics = get_mean_per_sample_loss(pg_loss, output_lens_broadcasted, minibatch["num_samples"]).item()
-    kl_div_metrics = get_mean_per_sample_loss(kl_div, output_lens_broadcasted, minibatch["num_samples"]).item()
     
+    loss_metrics = (loss.detach()/output_lens_broadcasted).sum().item()
+    pg_loss_metrics = (pg_loss.detach()/output_lens_broadcasted).sum().item()
+    kl_div_metrics = (kl_div.detach()/output_lens_broadcasted).sum().item()
+
     loss = (loss/output_lens_broadcasted).sum()
     # torch.distributed.breakpoint()
 
