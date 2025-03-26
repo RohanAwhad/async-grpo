@@ -23,6 +23,7 @@ def make_grpo_forward(model, loss_chunksize: int = None):
         num_logits_to_keep: int = 0,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        nonlocal loss_chunksize
         output_attentions = output_attentions if output_attentions is not None else model.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else model.config.output_hidden_states
@@ -49,15 +50,18 @@ def make_grpo_forward(model, loss_chunksize: int = None):
 
         if loss_chunksize is None or labels is None:
             loss_chunksize = 2**31 - 1  # max value for Python's int
-        else:
-            loss_chunksize = min(loss_chunksize, T)
+        
+        loss_chunksize = min(loss_chunksize, T)
 
+        local_labels = labels[:,1:]
+        shifted_labels = nn.functional.pad(local_labels, (0, 1), value=-100)[..., 1:].contiguous()
         total_loss = []
 
+        # torch.distributed.breakpoint()
         for i in range(0, T, loss_chunksize):
             end_idx = min(i + loss_chunksize, T)
             logits = model.lm_head(hidden_states[:, i:end_idx, :]).float()
-            loss = model.loss_function(logits=logits, labels=labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
+            loss = model.loss_function(logits=logits, labels=shifted_labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
             total_loss.append(loss)
 
         # torch.distributed.breakpoint()
@@ -121,15 +125,15 @@ def PerTokenLogProbsFromCE(
     logits = logits.float()
     labels = labels.to(logits.device)
     # Shift so that tokens < n predict n
-    labels = nn.functional.pad(labels, (0, 1), value=ignore_index)
-    shift_labels = labels[..., 1:].contiguous()
+    # labels = nn.functional.pad(labels, (0, 1), value=ignore_index)
+    # shift_labels = labels[..., 1:].contiguous()
 
     # Flatten the tokens
     logits = logits.view(-1, vocab_size)
-    shift_labels = shift_labels.view(-1)
+    labels = labels.view(-1)
     # Enable model parallelism
-    shift_labels = shift_labels.to(logits.device)
-    per_token_ce = nn.functional.cross_entropy(logits, shift_labels, reduction="none", ignore_index=ignore_index)
+    labels = labels.to(logits.device)
+    per_token_ce = nn.functional.cross_entropy(logits, labels, reduction="none", ignore_index=ignore_index)
     logprobs = -per_token_ce
     return logprobs
 
@@ -280,6 +284,6 @@ def compute_grpo_loss(
     kl_div_metrics = (kl_div.detach()/output_lens_broadcasted).sum().item()
 
     loss = (loss/output_lens_broadcasted).sum()
-    # torch.distributed.breakpoint()
+    torch.distributed.breakpoint()
 
     return loss, loss_metrics, pg_loss_metrics, kl_div_metrics
