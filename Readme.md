@@ -1,9 +1,33 @@
-# install
+# Async GRPO
 
+Ray-Based Asynchronous implementation of [Group Reward Policy Optimization](https://arxiv.org/pdf/2402.03300).
+
+With the advent of reasoning models and inference time scaling generation lengths are dramatically increasing, creating a huge bottleneck for reinforcement learning in general and for GRPO in particular. Current implementations of GRPO such as [HuggingFace's](https://github.com/huggingface/trl/blob/main//docs/source/grpo_trainer.md) or [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF?tab=readme-ov-file) lead to high GPU idle time by synchronously alternating between generation and training. 
+
+To attend to these needs we have created *_Async-GRPO_*. This library allows practioners to flexibly scale and independently schedule training and inference across multiple GPUs (regardless of number of nodes) while asynchronously going through the three main stages of GRPO: 1. Actor Roll out Generation, 2. Reference Log Probabilities Inference and 3. Actor training.
+
+![](async-grpo.drawio.svg)
+
+The main innovation is the ability to start training as soon as a minibatch is ready and automatically do gradient accumulation over a whole batch.
+
+### Features:
+- Uses FSDP via Accelerate for model sharding.
+- Padding free sample packing based on Flash Attention.
+- Don't worry about minibatches: Automatic minibatching and gradient accumulation. Minibatches are built online to keep tokens per GPU at a maximum value. 
+- Loss computed as the mean across ALL samples across ALL GPUs, and not mean the of GPU-based means: this avoid possible biases where one GPU consistently get a small number of samples compared to others.
+- Chunks the logit/loss computation to reduce memory spikes during training - can do full training 70b+ models on a single 8xA100 node.
+
+### Coming Soon
+- PyNCCL weight update from the actor to the generation and reference workers - currently using Ray Object storage which doesn't use RDMA for communication.
+- Improved delayed load balancing for generation efficiency: send requests to each worker when their current load goes bellow 2x their max concurrent capacity.
+- Tensor parallel VLLM workers for long CoTs on large models >=32Billion parameters.
+- Improved logging and visualizations.
+
+# install
 
 on all nodes do this:
 ```bash
-conda create -n base python=3.12.8 -y
+conda create -n base python=3.12 -y
 conda activate base
 pip install -r requirements_base.txt
 ```
@@ -46,13 +70,13 @@ for i in (seq 0 7)
             --tensor_parallel_size 1 \
             --max_num_seqs 128 \
             --write_failed_generation_samples \
-            --global_num_verifiers 100 | tee generation_worker_$i.log &
+            --global_num_verifiers 50 | tee generation_worker_$i.log &
     else
-        # CUDA_VISIBLE_DEVICES="$i" python logprob_worker.py --model_path /dev/shm/phi-4 &
         echo "Launching logprob worker on GPU $i..."
         torchrun --nproc_per_node=1 --master_port=1234$i worker_dispatcher.py \
             --model_path /dev/shm/qwen7b-math-base \
-            --mode logprob | tee logprob_worker_$i.log &
+            --mode logprob \
+            --max_tokens_per_gpu 30000 2>&1 | tee logprob_worker_$i.log &
     end
 end
 ```
@@ -62,7 +86,7 @@ In our test, we used two nodes, a total of 16 GPUs, 14 for generation and 2 for 
 ### start the training on the nodes you want to use for training, we've trained with 8 GPUs on a single training node.
 
 ```bash
-conda create grpo python=3.12.8 -y; conda activate grpo;pip install -r requirements_fsdp.txt
+conda create grpo python=3.12 -y; conda activate grpo; pip install -r requirements_fsdp.txt; pip install -r requirements_base.txt
 torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py 2>&1 | tee train_qwen.log
 ```
 
@@ -71,13 +95,16 @@ the hyperparameters to be tuned are in `trainer_core.py`.
 ### Troubleshooting
 
 - when a ray worker fails, the driver (the process that spawns such worker) shows unrelated errors. It's usually a module not found error in the child worker.
+- Sometimes errors happen and Ray logging handler fails to show the tracebacks, failing silently, debug printing to a file is recommended to enable visibility.
 - when things fail, do ray stop everywhere and restart the process on all nodes. Ray becomes a bit unstable when restarting processes.
 - It's important to create a separate conda environment for the training process or the worker environments will become corrupted. The python version should be the same as the base environment.
 - `ray list actors | grep ALIVE` can be used to check if all the expected workers are running.
 - make sure you can do enough http connections on your cluster: `ulimit -n 65535`
 - Ray creates a lot of temporary files in the `/tmp` directory. You can clean them up with `rm -rf /tmp/ray`. Also, you need enough space, otherwise use `ray start --temp-dir=/dev/shm/ray` to use the shared memory as a temporary directory.
 
-### Architecture Explanation
+
+
+# Architecture Explanation
 
 #### System Overview
 

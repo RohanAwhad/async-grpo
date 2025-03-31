@@ -166,28 +166,35 @@ rclone copy --copy-links /new_data/experiments_rh/phi-4-limo-chat-insertions/hf_
 set -x model_path "/dev/shm/phi-4-limo-chat-insertions-s17850"
 set -x model_path "/dev/shm/phi-4-limo-chat-insertions-s11901"
 set -x log_dir /new_data/experiments_rh/eval_qwen_1.5b_aime
-
-set -x model_path "/dev/shm/DeepSeek-R1-Distill-Qwen-1.5B"
 set -x log_dir /new_data/experiments_rh/qwen_1.5b_r1_distill_deepscaler_test
+rclone copy --copy-links /new_data/experiments_rh/nemotron-cps/phi_mini_499941 /dev/shm/phi_mini_499941
+rclone copy --copy-links /new_data/experiments_rh/nemotron-cps/phi_mini_999929/ /dev/shm/phi_mini_999929
+rclone copy --copy-links /new_data/experiments_rh/nemotron-cps/phi_mini_4499562/ /dev/shm/phi_mini_4499562
+rclone copy --copy-links /new_data/experiments_rh/nemotron-cps/phi_mini_2499716 /dev/shm/phi_mini_2499716
+rclone copy --copy-links /new_data/experiments_rh/phi_mini_2499716_deepscaler_128bs_8spq/hf_format/samples_60447.0 /dev/shm/phi-mini-grpo-s60447
+
+set -x rank_inference 0
+set -x model_path "microsoft/phi-4-mini-instruct"
+set -x log_dir /new_data/experiments_rh/erase
 mkdir -p $log_dir
 cd /new_data/aldo/v1_reasoning/grpo_feb_24th/
-for i in (seq 0 5)
-    if test $i -lt 5
+for i in (seq 0 7)
+    if test $i -lt 8
         echo "Launching generation worker on GPU $i..."
         python worker_dispatcher.py \
             --model_path $model_path \
             --mode generation \
             --tensor_parallel_size 1 \
-            --max_num_seqs 64 \
+            --max_num_seqs 32 \
             --write_failed_generation_samples \
-            --global_num_verifiers 50 2>&1 | tee $log_dir/generation_worker_$i.log &
+            --global_num_verifiers 50 2>&1 | tee $log_dir/generation_worker_$i_$rank_inference.log &
     else
         # CUDA_VISIBLE_DEVICES="$i" python logprob_worker.py --model_path /dev/shm/phi-4 &
         echo "Launching logprob worker on GPU $i..."
         torchrun --nproc_per_node=1 --master_port=1234$i worker_dispatcher.py \
             --model_path $model_path \
             --mode logprob \
-            --max_tokens_per_gpu 36000 2>&1 | tee $log_dir/logprob_worker_$i.log &
+            --max_tokens_per_gpu 30000 2>&1 | tee $log_dir/logprob_worker_$i_$rank_inference.log &
     end
 end
 

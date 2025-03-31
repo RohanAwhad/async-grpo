@@ -5,7 +5,14 @@ from typing import Optional, Tuple, Union, List
 import torch.nn as nn
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.processing_utils import Unpack
+
+DEBUG = False
+def debug_print(message):
+    if DEBUG:
+        rank = torch.distributed.get_rank()
+        with open(f"debug_grpo_loss_{rank}.log", "a") as f:
+            f.write(message + "\n")
+    print(message)
 
 def make_grpo_forward(model, loss_chunksize: int = None):
     def _forward(
@@ -29,7 +36,7 @@ def make_grpo_forward(model, loss_chunksize: int = None):
             output_hidden_states if output_hidden_states is not None else model.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else model.config.use_return_dict
-
+        debug_print(f"\033[1;38;2;255;165;0m _forward line 36: \033[0m input_ids.shape: {input_ids.shape}")
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = model.model(
             input_ids=input_ids,
@@ -46,6 +53,8 @@ def make_grpo_forward(model, loss_chunksize: int = None):
         )
         hidden_states = outputs[0]
 
+        debug_print(f"\033[1;38;2;255;165;0m _forward line 53: \033[0m hidden_states.shape: {hidden_states.shape}")
+
         T = hidden_states.shape[1]
 
         if loss_chunksize is None or labels is None:
@@ -53,57 +62,23 @@ def make_grpo_forward(model, loss_chunksize: int = None):
         
         loss_chunksize = min(loss_chunksize, T)
 
-        local_labels = labels[:,1:]
-        shifted_labels = nn.functional.pad(local_labels, (0, 1), value=-100)[..., 1:].contiguous()
+        # shift labels by one to the left so input_ids[0] predicts labels[1] and pad with -100 on the right since the last input_id doesn't correspond to any label.
+        shifted_labels = nn.functional.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
         total_loss = []
 
-        # torch.distributed.breakpoint()
         for i in range(0, T, loss_chunksize):
             end_idx = min(i + loss_chunksize, T)
             logits = model.lm_head(hidden_states[:, i:end_idx, :]).float()
             loss = model.loss_function(logits=logits, labels=shifted_labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
             total_loss.append(loss)
 
-        # torch.distributed.breakpoint()
         return CausalLMOutputWithPast(
             loss=torch.cat(total_loss, dim=0),
-            # logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-        
-    # def _forward(
-    #         input_ids=None,
-    #         attention_mask=None,
-    #         position_ids=None,
-    #         past_key_values=None,
-    #         inputs_embeds=None,
-    #         use_cache=None,
-    #         output_attentions=None,
-    #         output_hidden_states=None,
-    #         return_dict=None,
-    #         cache_position=None,
-    #         _output_indices=None,
-    #         **kwargs,
-    # ):
-    #     outputs = model.model(
-    #         input_ids=input_ids,
-    #         attention_mask=attention_mask,
-    #         position_ids=position_ids,
-    #         past_key_values=past_key_values,
-    #         inputs_embeds=inputs_embeds,
-    #         use_cache=use_cache,
-    #         output_attentions=output_attentions,
-    #         output_hidden_states=output_hidden_states,
-    #         return_dict=return_dict,
-    #         cache_position=cache_position,
-    #         **kwargs,
-    #     )
-    #     hidden_states = outputs[0]
-    #     # logits = model.lm_head(hidden_states[:, _output_indices, :]).contiguous().float()
-    #     logits = model.lm_head(hidden_states).contiguous().float()
-    #     return logits
+    
     model.__original_forward = model.forward
     model.forward = _forward
     return model
@@ -244,7 +219,14 @@ def compute_grpo_loss(
     ##### DEBUG #####
     # minibatch['samples'][0].keys()
     # minibatch['samples'][1]['sample_text']
+    # from transformers import AutoTokenizer
     # tokenizer = AutoTokenizer.from_pretrained(policy_model.config._name_or_path)
+    # tokenizer.decode(batch_ids[:,output_indices+1][:,:100].squeeze().tolist())
+    # tokenizer.decode(labels[labels!=-100][:100])
+    # tokenizer.decode(batch_ids[labels!=-100][:100].squeeze().tolist())
+    # tokenizer.decode(batch_ids[:, (reference_logprobs!=0) * (policy_logprobs==0)][:100].squeeze().tolist())
+    # (batch_ids[labels!=-100] - labels[labels!=-100]).sum()
+    # print(tokenizer.decode(batch_ids[0,:100].squeeze().tolist()))
     # print(tokenizer.decode(batch_ids[:,-1000:].squeeze().tolist()))
     # non_zero_logprobs = policy_logprobs[policy_logprobs != 0]
     # torch.abs(non_zero_logprobs).mean()
@@ -261,7 +243,7 @@ def compute_grpo_loss(
     # diff[idx[:10]]
     # i = idx[0]
     # [print(f"reflogprobs: {reference_logprobs[i]}, policylogprobs: {policy_logprobs[i]}, diff: {diff[i]}") for i in idx[:10]]
-    # diff[diff!=0].mean()
+    # debug_print(f"\033[1;38;2;255;165;0m _compute_grpo_loss line 272: \033[0m diff[diff!=0].mean(): {diff[labels[0]!=-100].mean()}")
     # print(tokenizer.decode(batch_ids[:,i-10:i+10].squeeze().tolist()))
     # diff[diff>1e-1].shape
     # (diff>1e-1).nonzero()
@@ -284,6 +266,6 @@ def compute_grpo_loss(
     kl_div_metrics = (kl_div.detach()/output_lens_broadcasted).sum().item()
 
     loss = (loss/output_lens_broadcasted).sum()
-    torch.distributed.breakpoint()
+    # torch.distributed.breakpoint()
 
     return loss, loss_metrics, pg_loss_metrics, kl_div_metrics

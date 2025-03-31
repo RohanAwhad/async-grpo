@@ -5,10 +5,18 @@ import asyncio
 import time
 
 # Simple debug logger that writes to a file named debug.log
+DEBUG = False
 def debug_log(message: str):
-    print(f"\033[1;38;2;57;255;20m{message}\033[0m")
-    with open("debug.log", "a") as f:
-        f.write(message + "\n")
+    if DEBUG:
+        # Retrieve the current actor’s unique ID.
+        try:
+            current_actor_id = ray.get_runtime_context().get_actor_id()
+        except Exception as e:
+            current_actor_id = "unknown"
+            print(f"Error getting actor ID: {e}")
+        print(f"\033[1;38;2;57;255;20m{message}\033[0m")
+        with open(f"debug_{current_actor_id}.log", "a") as f:
+            f.write(message + "\n")
 
 @ray.remote
 class VLLMRegistry:

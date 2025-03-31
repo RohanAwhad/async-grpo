@@ -120,7 +120,7 @@ def post_process_batch(batched_questions, device):
             f"\033[1;96;40mReward:\033[0m {sample['reward']}\n" +
             f"\033[1;96;40mGround Truth Answer:\033[0m {sample['answer']}\n" +
             (f"\033[1;96;40mParsed Ground Truth Answer:\033[0m {sample['parsed_gt_answer']}\n" if 'parsed_gt_answer' in sample else "") +
-            (f"\033[1;96;40mParsed Attempt: {sample['parsed_attempt']}\033[0m\n" if 'parsed_attempt' in sample else f"\033[1;38;5;196mFailed verification\033[0m")
+            (f"\033[1;96;40mParsed Attempt: {sample['parsed_attempt']}\033[0m\n" if 'parsed_attempt' in sample else f"\033[1;38;5;196mFailed verification\033[0m\n")
         )
     advantages = np.array([s['advantage'] for s in batched_questions])
     # print("\033[1;91;40mDEBUG using sample lens (not outputlens to broadcast)\033[0m")

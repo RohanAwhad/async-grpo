@@ -13,21 +13,24 @@ data = Dataset.from_list(data)
 ##
 from transformers import AutoTokenizer
 # model_path = "Qwen/Qwen2.5-1.5B-Instruct"
-model_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+# model_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+model_path = "/dev/shm/phi_mini_2499716"
 # model_path = "Qwen/Qwen2.5-1.5B"
 tokenizer = AutoTokenizer.from_pretrained(model_path, token= "***REMOVED***")
 tokenizer.add_bos_token = False
 
 def make_initial_prompt(sample):
-    system_prompt = r"""Let's think step by step and output the final answer within \boxed{}. """
+    # system_prompt = r"""Let's think step by step and output the final answer within \boxed{}. """
+    system_prompt = r"""detailed thinking on"""
     # system_prompt = ""
     messages = [
-        {"role": "user", "content": system_prompt + sample['problem']},
+        {"role": "system", "content": system_prompt },
+        {"role": "user", "content": sample['problem']},
     ]
     sample['messages'] = messages
     sample['input'] = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     # sample['input'] = messages[0]['content']
-    sample['input_token_ids'] = tokenizer.encode(sample['input'])
+    sample['input_token_ids'] = tokenizer.encode(sample['input'], add_special_tokens=False)
     if tokenizer.decode(sample['input_token_ids']) != sample['input']:
         decoded = tokenizer.decode(sample['input_token_ids'])
         print(sample['input'])
@@ -40,9 +43,11 @@ def make_initial_prompt(sample):
     return sample
 
 data = data.map(make_initial_prompt, num_proc=16)
+from IPython import embed
+embed()
 data = data.filter(lambda x: not x['error'])
 
-data.to_json("deepscaler_qwen1.5b_r1_distill.jsonl", lines=True)
+data.to_json("deepscaler_phi_mini_nemotron.jsonl", lines=True)
 
 print(data[1]['input'])
 print(tokenizer.decode(data[1]['input_token_ids']))

@@ -120,13 +120,13 @@ class LogprobWorker:
                     inference_requests.append(current_request)
                 except asyncio.TimeoutError:
                     # Timeout: no more requests available now.
-                    logging.debug(f"\033[1;38;2;255;0;255m _centralize_inference_requests line 153: \033[0m no more items in the batching queue timeout")
+                    logging.debug(f"\033[1;38;2;255;0;255m _centralize_inference_requests line 123: \033[0m no more items in the batching queue timeout")
                     current_request = None
                     break
             if inference_requests:
                 futures, samples = zip(*inference_requests)
                 samples_with_logprobs = self._compute_logprobs(samples)
-                logging.debug(f"\033[1;38;2;0;255;255m _centralize_inference_requests line 160: \033[0m computed samples_with_logprobs length of batch_queue: {self.batching_queue.qsize()}")
+                logging.debug(f"\033[1;38;2;0;255;255m _centralize_inference_requests line 129: \033[0m computed samples_with_logprobs length of batch_queue: {self.batching_queue.qsize()}")
                 for future, sample_with_logprobs in zip(futures, samples_with_logprobs):
                     if not future.done():
                         future.set_result(sample_with_logprobs)
@@ -150,6 +150,7 @@ class LogprobWorker:
         log_probs = torch.split(log_probs, sample_lens)
         for s, log_prob in zip(samples, log_probs):
             s['sample_logprobs'] = log_prob.tolist()
+        logging.debug(f"\033[1;38;2;0;255;255m _centralize_inference_requests line 153: \033[0m computed samples_with_logprobs length of {len(samples)}")
         return samples
     
 if __name__ == "__main__":

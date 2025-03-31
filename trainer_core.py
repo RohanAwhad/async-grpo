@@ -311,7 +311,8 @@ if __name__ == "__main__":
         # default="/dev/shm/qwen-2.5-3b-instruct",
         # default="/dev/shm/Qwen2.5-1.5B-Instruct",
         # default="/dev/shm/Qwen2.5-1.5B",
-        default="/dev/shm/DeepSeek-R1-Distill-Qwen-1.5B",
+        # default="/dev/shm/DeepSeek-R1-Distill-Qwen-1.5B",
+        default="/dev/shm/phi_mini_2499716",
         # default="Qwen/Qwen2.5-Math-7B",
         # default="/dev/shm/phi-4",
         type=str,
@@ -331,7 +332,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=128, #TODO: change to 32 for a real experiment
+        default=126, #TODO: change to 32 for a real experiment
         help="Global batch size of questions per gradient step. The batch will be split among GPUs even if not divisible by the number of GPUs."
     )
 
@@ -345,7 +346,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_warmup_steps",
         type=int,
-        default=10,
+        default=20,
         help="Number of warmup steps for the scheduler."
     )
 
@@ -367,14 +368,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_tokens_per_gpu",
         type=int,
-        default=32768,
+        # default=44900,
+        default=30000,
+        # default=2000,
         help="Maximum number of tokens per GPU."
     )
 
     parser.add_argument(
         "--loss_chunksize",
         type=int,
-        default=512,
+        default=2048,
+        # default=None,
         help="Number of tokens to process at a time for the loss computation. This avoids creating the logits matrix all at once in memory (sequence length x vocab size) which creates a really large memory spike. None means no chunking."
     )
 
@@ -407,14 +411,15 @@ if __name__ == "__main__":
         # default="/new_data/aldo/v1_reasoning/math_simplerl_qwen_data_token_ids.jsonl",
         # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/countdown.jsonl",
         # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_initial_prompt.jsonl",
-        default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_initial_prompt_qwen1.5b_base.jsonl",
+        # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_initial_prompt_qwen1.5b_base.jsonl",
+        default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_phi_mini_nemotron.jsonl",
         help="Path to the data file."
     )
 
     parser.add_argument(
         "--min_samples_per_checkpoint",
         type=int,
-        default=100000,
+        default=30000,
         help="Minimum number of samples per checkpoint."
     )
 
@@ -436,11 +441,11 @@ if __name__ == "__main__":
             model, 
             optimizer,
             lr_scheduler,
-            samples_per_question=16, 
+            samples_per_question=8, 
             kl_coeff=0.001,
             accelerator=accelerator,
             num_iterations=1000000,
-            num_batches_per_ref_model_update=20,
+            num_batches_per_ref_model_update=40,
         )
     )
 
@@ -453,18 +458,23 @@ set -x log_dir /new_data/experiments_rh/deepscaler_no_inserts_qwen1.5b_base_5e-6
 set -x log_dir /new_data/experiments_rh/qwen1.5b_limo_s3143_deepscaler_64spq
 set -x log_dir /new_data/experiments_rh/testing_vllm_failures
 set -x log_dir /new_data/experiments_rh/qwen_base_1.5_deepscaler_128bs_64spq
-
-
 set -x log_dir /new_data/experiments_rh/qwen_1.5b_r1_distill_deepscaler_test
-mkdir -p $log_dir
-CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2  trainer_core.py \
-     --output_dir $log_dir 2>&1 \
-    | tee $log_dir/train.log
-# torchrun --nproc_per_node=4 trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
-set -x rank 0
+set -x log_dir /new_data/experiments_rh/qwen_1.5b_r1_distill_deepscaler_v2
+
+
 set -Ux NCCL_SOCKET_IFNAME eth1
 set -Ux NCCL_IB_DISABLE 1
+set -x log_dir /new_data/experiments_rh/phi_mini_2499716_deepscaler_128bs_8spq
+set -x rank 0
+mkdir -p $log_dir
+cd /new_data/aldo/v1_reasoning/grpo_feb_24th/
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nnodes=1 --node_rank=$rank --nproc_per_node=8 --rdzv_id=101 \
+    --rdzv_endpoint="10.241.128.19:54367" trainer_core.py \
+     --output_dir $log_dir 2>&1 \
+    | tee $log_dir/train_$rank.log
+# torchrun --nproc_per_node=4 trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
+set -x rank 0
 mkdir -p ~/grpo
-torchrun --nnodes=1 --node_rank=$rank --nproc_per_node=8 --rdzv_id=101 \
-    --rdzv_endpoint="10.241.128.17:54367" trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
+torchrun --nnodes=1 --node_rank=$rank --nproc_per_node=1 --rdzv_id=101 \
+    --rdzv_endpoint="10.241.128.19:54367" trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
 '''
