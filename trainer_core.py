@@ -16,6 +16,7 @@ from setup_model import setup_model, setup_training_components
 from grpo_loss import compute_grpo_loss
 from utils import init_distributed_environment, log_rank_0, setup_logger
 from sample_processing_utils import post_process_batch
+from batch_metrics import BatchMetrics
 
 
 class JsonlDataset(Dataset):
@@ -107,6 +108,7 @@ def update_vllm_worker_weights(model, accelerator, registry_actor_names=["refere
         for registry_actor_name in registry_actor_names:
             # Get the registry actor which maintains the inference actors.
             registry = ray.get_actor(registry_actor_name)
+            tasks.append(registry.update_weights.remote(new_state_dict=state_ref))
             replica_handles = ray.get(registry.get_actors.remote())
             tasks.extend([handle.update_weights.remote(new_state_dict=state_ref)
                         for handle in replica_handles])
@@ -141,7 +143,7 @@ async def remote_queue_batch_generator(global_rank: int,
             break
         yield post_process_batch(batch, device)
 
-def scale_model_gradients(model, total_samples_in_batch):
+def scale_model_gradients(model, total_samples_in_batch, num_samples_per_question):
     """
     Scale gradients for every parameter in the model by world_size/total_samples_in_batch.
     It's necessary to scale by world_size because fsdp takes the mean of the gradients across the world_size.
@@ -150,19 +152,21 @@ def scale_model_gradients(model, total_samples_in_batch):
         model: The torch model whose gradients should be scaled.
         total_samples_in_batch: The number of samples in the batch.
     """
+    # the more samples per question, 
     scale_factor = 1.0 / total_samples_in_batch
     for param in model.parameters():
         if param.grad is not None:
             param.grad.mul_(scale_factor)
 
-def take_gradient_step(model, optimizer, lr_scheduler, accelerator, total_samples_accumulated):
+def take_gradient_step(model, optimizer, lr_scheduler, accelerator, total_samples_accumulated, num_samples_per_question):
     """Scales gradients, applies clipping, and takes an optimization step."""
-    scale_model_gradients(model, total_samples_accumulated)
+    scale_model_gradients(model, total_samples_accumulated, num_samples_per_question)
     grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
     print(f"\033[1;38;2;255;165;0mGlobal Grad Norm:\033[0m {grad_norm} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}")
     optimizer.step()
     lr_scheduler.step()
     optimizer.zero_grad()
+    return grad_norm
 
 async def train(args,
                 policy_model, 
@@ -178,6 +182,17 @@ async def train(args,
     Main training loop following Algorithm 1 from the paper.
     Simplified version since with μ=1, π_old = π_current during sampling.
     """
+    log_rank_0("==================================================")
+    log_rank_0("           TRAINING CONFIGURATION")
+    log_rank_0(f"Num Iterations                  : {num_iterations}")
+    log_rank_0(f"KL Coefficient                  : {kl_coeff}")
+    log_rank_0(f"Num Batches per Ref Model Update: {num_batches_per_ref_model_update}")
+    log_rank_0(f"Samples per Question             : {samples_per_question}")
+    log_rank_0("--------------------------------------------------")
+    log_rank_0("           TRAINING ARGUMENTS (args)")
+    for arg_key, arg_value in sorted(vars(args).items()):
+        log_rank_0(f"{arg_key:30s}: {arg_value}")
+    log_rank_0("==================================================")
     # update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["generation_vllm_registry"])
     model.train()
     dataloader = iter(get_dataloader(args.batch_size, path=args.data_path))
@@ -188,9 +203,7 @@ async def train(args,
     batcher_actor = ray.get_actor(args.experience_batcher_name, namespace="test")
     total_samples_accumulated = 0
     last_saved_samples = 0
-
-    # actor_registry = ray.get_actor("generation_vllm_registry")
-    # reference_registry = ray.get_actor("logprob_vllm_registry")
+    batch_totals = BatchMetrics()
     
     # Outermost loop: Policy iteration
     for iteration in range(num_iterations):
@@ -199,83 +212,91 @@ async def train(args,
         for step in range(num_batches_per_ref_model_update):
             start_time = time.time()
             batch = next(dataloader)
+            torch.distributed.barrier()
             await batcher_actor.generate_experience.remote(
                 batch,
                 samples_per_question,
                 actor_registry="generation_vllm_registry",
                 reference_registry="logprob_vllm_registry",
                 temperature=args.temperature,
+                max_tokens=args.max_generation_tokens,
+                insert_reasoning_phrases=args.insert_reasoning_phrases,
                 timeout=1200 # 20 minutes per batch of questions or skipped. --> adjust depending on settings.
             )
             torch.distributed.barrier()
             if accelerator.is_main_process:
                 ray.get(batcher_actor.start_creating_batches.remote())
             torch.distributed.barrier()
-            samples_in_batch = 0
-            reward_accumulated_in_batch = 0
-            output_tokens_in_batch = 0
+
+            # Initialize a Metrics instance for accumulating minibatch metrics
+            batch_totals.reset_batch()
             async for minibatch in remote_queue_batch_generator(args.global_rank, 
                                                                 device,
                                                                 batcher_actor_name=args.experience_batcher_name):
-                loss, loss_rank, pg_loss, kl_div = compute_grpo_loss(
+                loss, loss_metrics, pg_loss, kl_div = compute_grpo_loss(
                     policy_model,
                     minibatch,
                     kl_coeff,
                 )
-
                 # Multiply the loss by the number of GPUs to account for FSDP's mean reduction.
                 # Gradient scaling divides by the total number of samples in the batch across all GPUs.
                 loss *= int(os.environ["WORLD_SIZE"])
-
-                total_num_output_tokens, total_num_samples, total_reward = map(
-                    lambda x: x.item(),
-                    accelerator.reduce(
-                        torch.tensor([
-                            minibatch["num_output_tokens"],
-                            minibatch["num_samples"],
-                            minibatch["total_reward_rank"]
-                        ], device=accelerator.device),
-                        reduction="sum"
-                    )
-                )
-                
-                print(
-                    f"\033[1;38;2;255;165;0mActual Loss:\033[0m {loss.item()} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}\n"
-                    f"\033[1;38;2;255;165;0mLoss Rank:\033[0m {loss_rank} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}\n"
-                    f"\033[1;38;2;255;165;0mPG Loss:\033[0m {pg_loss} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}\n"
-                    f"\033[1;38;2;255;165;0mKL Div:\033[0m {kl_div} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}\n"
-                )
-                if accelerator.is_main_process:
-                    print(
-                        f"\033[1;38;2;255;255;0mAverage Total Output Tokens:\033[0m {total_num_output_tokens/total_num_samples} \033[1;38;2;255;255;0mRank:\033[0m {accelerator.process_index}\n"
-                        f"\033[1;38;2;255;255;0mAverage Reward:\033[0m {total_reward/total_num_samples} \033[1;38;2;255;255;0mRank:\033[0m {accelerator.process_index}\n"
-                    )
                 accelerator.backward(loss)
-
-                total_samples_accumulated += total_num_samples
-                reward_accumulated_in_batch += total_reward
-                samples_in_batch += total_num_samples
-                output_tokens_in_batch += total_num_output_tokens
                 torch.cuda.empty_cache()
-            # Always take a gradient step before updating vLLM workers
-            take_gradient_step(model, optimizer, lr_scheduler, accelerator, samples_in_batch)
+
+                
+                # Accumulate metrics in the Metrics instance
+                batch_totals.accumulate_minibatch_metrics(
+                    output_tokens = minibatch["num_output_tokens"],
+                    samples = minibatch["num_samples"],
+                    reward = minibatch["total_reward_rank"],
+                    modified_reward = minibatch["total_modified_reward"],
+                    modified_samples = minibatch["num_modified_samples"],
+                    delimiter_not_found = minibatch["delimiter_not_found"],
+                    non_modified_reward = minibatch["total_non_modified_reward"],
+                    max_reward_in_group = minibatch["max_reward_in_group"],
+                    loss = loss_metrics,
+                    pg_loss = pg_loss,
+                    kl_div = kl_div,
+                )
+
+            # End async for
+
+            # Reduce minibatch metrics and accumulate into batch_metrics
+            batch_totals.reduce_batch_metrics(accelerator)
+
+            # Use accumulated metrics for gradient step and logging
+            bm = batch_totals.totals
+            batch_num_samples = bm["samples"]
+            total_samples_accumulated += batch_num_samples
+            grad_norm = take_gradient_step(model, optimizer, lr_scheduler, accelerator, batch_num_samples, samples_per_question)
+
             if accelerator.is_main_process:
                 print(
-                    f"\033[1;38;2;255;0;255mAverage Reward Accumulated in Batch:\033[0m {reward_accumulated_in_batch/samples_in_batch} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
-                    f"\033[1;38;2;255;0;255mAverage Output Tokens in Batch:\033[0m {output_tokens_in_batch/samples_in_batch} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
-                    f"\033[1;38;2;255;0;255mTime taken for batch:\033[0m {time.time() - start_time:.2f} seconds\n"
-                    f"\033[1;38;2;255;0;255mNum samples in batch:\033[0m {samples_in_batch}\n"
+                    f"\033[1;38;2;255;0;255mAverage Reward Accumulated in Batch:\033[0m {bm['reward']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;255;0;255mAverage Output Tokens in Batch:\033[0m {bm['output_tokens']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;255;0;255mAverage Loss in Batch:\033[0m {bm['loss']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
                     f"\033[1;38;2;255;0;255mLearning Rate:\033[0m {lr_scheduler.get_last_lr()}\n"
+                    f"\033[1;38;2;255;0;255mAverage PG Loss in Batch:\033[0m {bm['pg_loss']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;255;0;255mAverage KL Div Accumulated in Batch:\033[0m {bm['kl_div']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;255;0;255mAverage Modified Reward in Batch:\033[0m {bm['modified_reward']/(bm['modified_samples']+1e-6)} \033[1;38;2;255;0;255m Num Modified Samples:\033[0m {bm['modified_samples']}\n"
+                    f"\033[1;38;2;255;0;255mAverage Delimiter Not Found in Batch:\033[0m {bm['delimiter_not_found']/(bm['modified_samples']+1e-6)}\n"
+                    f"\033[1;38;2;255;0;255mAverage Non Modified Reward in Batch:\033[0m {bm['non_modified_reward']/(batch_num_samples - bm['modified_samples'])}\n"
+                    f"\033[1;38;2;255;0;255mAverage Max Reward in Group in Batch:\033[0m {bm['max_reward_in_group']/batch_num_samples}\n"
+                    f"\033[1;38;2;255;0;255mGrad Norm:\033[0m {grad_norm} samples trained on:\033[0m {total_samples_accumulated}\n"
+                    f"\033[1;38;2;0;255;0mSamples in Current Batch:\033[0m {bm['samples']}\n"
+                    f"\033[1;38;2;255;0;255mTime taken for batch:\033[0m {time.time() - start_time:.2f} seconds\n"
                 )
 
             if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
                 save_model(args, model, accelerator, total_samples_accumulated)
                 last_saved_samples = total_samples_accumulated
             
-            # torch.distributed.breakpoint()
-            update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["generation_vllm_registry"])
+            #update both logprob and generation workers at the last step of the ref model update loop
+            registry_actor_names = ["generation_vllm_registry", "logprob_vllm_registry"] if step == num_batches_per_ref_model_update - 1 else ["generation_vllm_registry"]
+            update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=registry_actor_names)
         
-        update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["logprob_vllm_registry"])
+        # update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["logprob_vllm_registry"])
             
 
 
@@ -286,7 +307,12 @@ if __name__ == "__main__":
     # Model and Tokenizer
     parser.add_argument(
         "--model_name_or_path",
-        default="/dev/shm/qwen7b-math-base",
+        # default="/dev/shm/qwen7b-math-base",
+        # default="/dev/shm/qwen-2.5-3b-instruct",
+        # default="/dev/shm/Qwen2.5-1.5B-Instruct",
+        # default="/dev/shm/Qwen2.5-1.5B",
+        # default="/dev/shm/DeepSeek-R1-Distill-Qwen-1.5B",
+        default="/dev/shm/phi_mini_2499716",
         # default="Qwen/Qwen2.5-Math-7B",
         # default="/dev/shm/phi-4",
         type=str,
@@ -297,7 +323,7 @@ if __name__ == "__main__":
     # Training Parameters
     parser.add_argument(
         "--learning_rate",
-        default=5e-7,
+        default=5e-6,
         type=float,
         # required=True,
         help="Learning rate for training."
@@ -306,7 +332,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=256, #TODO: change to 32 for a real experiment
+        default=126, #TODO: change to 32 for a real experiment
         help="Global batch size of questions per gradient step. The batch will be split among GPUs even if not divisible by the number of GPUs."
     )
 
@@ -320,7 +346,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_warmup_steps",
         type=int,
-        default=40,
+        default=20,
         help="Number of warmup steps for the scheduler."
     )
 
@@ -342,43 +368,70 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_tokens_per_gpu",
         type=int,
-        default=26000,
+        # default=44900,
+        default=30000,
+        # default=2000,
         help="Maximum number of tokens per GPU."
+    )
+
+    parser.add_argument(
+        "--loss_chunksize",
+        type=int,
+        default=2048,
+        # default=None,
+        help="Number of tokens to process at a time for the loss computation. This avoids creating the logits matrix all at once in memory (sequence length x vocab size) which creates a really large memory spike. None means no chunking."
     )
 
     # Added new argument for temperature with a default value of 1.0
     parser.add_argument(
         "--temperature",
         type=float,
-        default=1.0,
+        default=0.6,
         help="Sampling temperature for generating experience."
+    )
+
+    parser.add_argument(
+        "--max_generation_tokens",
+        type=int,
+        default=8192,
+        help="Maximum number of tokens to generate per rollout."
+    )
+
+    parser.add_argument(
+        "--insert_reasoning_phrases",
+        action="store_true",
+        default=False,
+        help="Enable rewriting to insert reasoning phrases during inference."
     )
 
     parser.add_argument(
         "--data_path",
         type=str,
         # default="/new_data/aldo/v1_reasoning/grpobk/limo_data_cleaned_phi_4_format.jsonl",
-        default="/new_data/aldo/v1_reasoning/math_simplerl_qwen_data_token_ids.jsonl",
+        # default="/new_data/aldo/v1_reasoning/math_simplerl_qwen_data_token_ids.jsonl",
+        # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/countdown.jsonl",
+        # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_initial_prompt.jsonl",
+        # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_initial_prompt_qwen1.5b_base.jsonl",
+        default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_phi_mini_nemotron.jsonl",
         help="Path to the data file."
     )
 
     parser.add_argument(
         "--min_samples_per_checkpoint",
         type=int,
-        default=64000,
+        default=30000,
         help="Minimum number of samples per checkpoint."
     )
 
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/new_data/experiments_rh/simple_r1_replica_v2",
+        default="/new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter",
         help="Output directory where model checkpoints and configuration files will be saved."
     )
 
     args = parser.parse_args()
     init_distributed_environment(args)
-
     model = setup_model(args)
     model, accelerator, optimizer, lr_scheduler = setup_training_components(args, model)
 
@@ -388,15 +441,40 @@ if __name__ == "__main__":
             model, 
             optimizer,
             lr_scheduler,
-            samples_per_question=64, 
-            kl_coeff=0.04,
+            samples_per_question=8, 
+            kl_coeff=0.001,
             accelerator=accelerator,
-            num_iterations=100000,
-            num_batches_per_ref_model_update=10,
+            num_iterations=1000000,
+            num_batches_per_ref_model_update=40,
         )
     )
 
 '''
-# torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py
-CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=12345 trainer_core.py 2>&1 | tee train_qwen.log
+# set -x log_dir /new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter
+set -x log_dir /new_data/experiments_rh/deepscaler_no_insert_qwen1.5b_base
+     --insert_reasoning_phrases \
+set -x log_dir /new_data/experiments_rh/deepscaler_with_inserts_qwen1.5b_base
+set -x log_dir /new_data/experiments_rh/deepscaler_no_inserts_qwen1.5b_base_5e-6
+set -x log_dir /new_data/experiments_rh/qwen1.5b_limo_s3143_deepscaler_64spq
+set -x log_dir /new_data/experiments_rh/testing_vllm_failures
+set -x log_dir /new_data/experiments_rh/qwen_base_1.5_deepscaler_128bs_64spq
+set -x log_dir /new_data/experiments_rh/qwen_1.5b_r1_distill_deepscaler_test
+set -x log_dir /new_data/experiments_rh/qwen_1.5b_r1_distill_deepscaler_v2
+
+
+set -Ux NCCL_SOCKET_IFNAME eth1
+set -Ux NCCL_IB_DISABLE 1
+set -x log_dir /new_data/experiments_rh/phi_mini_2499716_deepscaler_128bs_8spq
+set -x rank 0
+mkdir -p $log_dir
+cd /new_data/aldo/v1_reasoning/grpo_feb_24th/
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nnodes=1 --node_rank=$rank --nproc_per_node=8 --rdzv_id=101 \
+    --rdzv_endpoint="10.241.128.19:54367" trainer_core.py \
+     --output_dir $log_dir 2>&1 \
+    | tee $log_dir/train_$rank.log
+# torchrun --nproc_per_node=4 trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
+set -x rank 0
+mkdir -p ~/grpo
+torchrun --nnodes=1 --node_rank=$rank --nproc_per_node=1 --rdzv_id=101 \
+    --rdzv_endpoint="10.241.128.19:54367" trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
 '''

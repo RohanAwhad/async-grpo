@@ -3,6 +3,7 @@ from copy import deepcopy
 from functools import partial
 from hashlib import sha256
 import json
+import os
 import random
 import logging
 import time
@@ -26,7 +27,81 @@ import numpy as np
 from numba import njit
 logging.getLogger('numba').setLevel(logging.WARNING)
 
+logging.basicConfig(level=logging.DEBUG)
+logging.getLogger().setLevel(logging.INFO)
 
+
+
+delimiter = '\n\n'
+# special_phrases = ['', 'The answer is \\boxed{', 'Let\'s doublecheck!', 'Alternatively']
+special_phrases = [
+    'Wait!',
+    # 'Let\'s try another method to solve the problem:',
+    # 'Now, let\'s think again:',
+    # 'Let\'s doublecheck the work so far.',
+    # 'Alternatively',
+    # 'Let\'s look at it from a different perspective:',
+]
+
+def get_indices_of_delimiter(response, delimiter):
+    indices = []
+    start = 0
+    while True:
+        index = response.find(delimiter, start)
+        if index == -1:
+            break
+        indices.append(index)
+        start = index + len(delimiter)
+    return indices
+
+def insert_phrase(response, delimiter, special_phrases, eos_str):
+    """
+    Modifies the response by finding all occurrences of the delimiter,
+    choosing one occurrence at random, truncating the response at that point,
+    and appending a random phrase from special_phrases.
+    
+    Parameters:
+        response (str): The original string.
+        delimiter (str): The delimiter to search for in response.
+        special_phrases (list of str): A list of phrases to randomly append.
+    
+    Returns:
+        str: The modified string.
+    """
+    chosen_index = None
+    # Find all indices where the delimiter occurs
+    indices = get_indices_of_delimiter(response, delimiter)
+    
+    # If we found any delimiters, choose one at random and truncate the response.
+    if not indices:
+        delimiter = '\n'
+        indices = get_indices_of_delimiter(response, delimiter)
+
+    if indices:
+        chosen_index = random.choice(indices)
+        # Option 1: If you want to discard the delimiter itself, use:
+        truncated_response = response[:(chosen_index + len(delimiter))]
+    else:
+        # If no delimiter is found, just keep the full response.
+        truncated_response = response.split(eos_str)[0] + delimiter
+        print(f"\033[1;38;2;255;0;0mNo delimiter found in response\033[0m")
+    
+
+    # Append a random phrase from special_phrases.
+    random_phrase = random.choice(special_phrases)
+
+    delimiter_not_found = chosen_index is None
+    
+    return truncated_response + random_phrase, delimiter_not_found
+
+async def rewrite_with_insert_phrase(sample, tokenizer):
+    full_text = sample['sample_text']
+    original_output = full_text.split(sample['input'])[-1]
+    modified_output, delimiter_not_found = insert_phrase(original_output, delimiter, special_phrases, tokenizer.eos_token)
+    sample['input'] = sample['input'] + modified_output
+    sample['input_token_ids'] = tokenizer.encode(sample['input'])
+    sample['delimiter_not_found'] = delimiter_not_found
+    return sample
 
 @njit
 def normalize_rewards(rewards):
@@ -56,42 +131,37 @@ class BaseVLLMWorker:
     """
     def __init__(self, model_path: str, worker_id: str,
                  tensor_parallel_size: int = 1, max_num_seqs: int = 16):
+        self.counter = 0
         self.model_path = model_path
         self.worker_id = worker_id
-        self.counter = 0
         print(f"Initializing {self.__class__.__name__} with model path: {model_path}")
         self.engine_args = self.get_engine_args(model_path, tensor_parallel_size, max_num_seqs)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.llm = AsyncLLMEngine.from_engine_args(self.engine_args)
-        atexit.register(lambda: asyncio.get_event_loop().create_task(self._async_cleanup()))
+        self.llm = AsyncLLMEngine.from_engine_args(self.engine_args, start_engine_loop=True)
+        self.registry = get_or_create_registry("generation_vllm_registry")
+        self.setup_registration()
     
     def get_engine_args(self, model_path: str, tensor_parallel_size: int, max_num_seqs: int) -> AsyncEngineArgs:
         raise NotImplementedError("Subclasses must implement get_engine_args method.")
     
     def setup_registration(self):
         try:
+            '''double dereference since the returned value is an object storage reference from ray.put'''
+            last_weights = ray.get(ray.get(self.registry.get_last_weights.remote()))
+            if last_weights is not None:
+                self.update_weights(last_weights)
             ray.get(self.registry.register.remote(service_id=self.worker_id))
             print(f"Worker {self.worker_id} registered.")
         except Exception as e:
             print(f"Error during registration for worker {self.worker_id}: {e}")
     
-    async def _async_cleanup(self):
-        try:
-            await self.registry.deregister.remote(service_id=self.worker_id)
-            print(f"Worker {self.worker_id} deregistered successfully.")
-        except Exception as e:
-            print(f"Error during async cleanup of worker {self.worker_id}: {e}")
-    
     def update_weights(self, new_state_dict: dict):
         llm_model = self.llm.engine.model_executor.driver_worker.model_runner.model
-        # for k,v in new_state_dict.items():
-        #     v = v.to("cuda")
-        #     llm_model.load_weights({k: v}.items())
         llm_model.load_weights(new_state_dict.items())
         print(f"vLLM weights updated successfully on service {self.worker_id}.")
         return True
     
-    async def inference(self, input_data: dict, **kwargs) -> list[dict]:
+    async def inference(self, sample: dict, **kwargs) -> list[dict]:
         """
         Base inference:
           - Input: input_data must include 'input_token_ids'.
@@ -99,7 +169,7 @@ class BaseVLLMWorker:
           - Constructs a SamplingParams object and then performs inference.
         """
         try:
-            input_ids = input_data['input_token_ids']
+            input_ids = sample['input_token_ids']
             sampling_params = SamplingParams(
                 **kwargs
             )
@@ -129,8 +199,6 @@ class GenerationVLLMWorker(BaseVLLMWorker):
         # Pass the common parameters to the base initializer.
         self.verifier_pool = get_or_create_verifier_pool(global_num_verifiers, write_failed)
         super().__init__(model_path, worker_id, tensor_parallel_size, max_num_seqs)
-        self.registry = get_or_create_registry("generation_vllm_registry")
-        self.setup_registration()
     
     def get_engine_args(self, model_path: str, tensor_parallel_size: int, max_num_seqs: int) -> AsyncEngineArgs:
         from transformers import AutoConfig
@@ -143,19 +211,32 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             enable_prefix_caching=True,
             max_num_seqs=max_num_seqs,
             max_model_len=config.max_position_embeddings,
+            disable_log_requests=False,
+            disable_log_stats=False,
         )
     
-    async def inference(self, sample: dict, max_new_tokens: int = None, **kwargs) -> list[dict]:
-        # For generation, parameters are flexible.
-        generation_kwargs = {
+    def get_max_tokens(self, sample: dict, max_tokens=None) -> int:
+        max_tokens = max_tokens if max_tokens is not None else self.engine_args.max_model_len
+        max_tokens = max_tokens - len(sample['input_token_ids']) - 1
+        if max_tokens <= 0:
+            max_tokens = 1
+            print(f"\033[1;38;2;255;165;0mMax tokens is less than 0 for sample: \033[0m {sample['input']}")
+        return max_tokens
+    
+    def get_gen_kwargs(self, sample: dict, **kwargs) -> dict:
+        return {
             "n": kwargs.get("n", 1),
-            "max_tokens": max_new_tokens if max_new_tokens is not None \
-                else self.engine_args.max_model_len - len(sample['input_token_ids']) - 1,
+            "max_tokens": self.get_max_tokens(sample, kwargs.get("max_tokens", self.engine_args.max_model_len)),
             "temperature": kwargs.get("temperature", 0.7),
-            "include_stop_str_in_output": True,
+            "include_stop_str_in_output": kwargs.get("include_stop_str_in_output", True),
             "spaces_between_special_tokens": False,
             "skip_special_tokens": False,
         }
+    
+    async def inference(self, sample: dict, **kwargs) -> list[dict]:
+        insert_reasoning_phrases = kwargs.get("insert_reasoning_phrases", False)
+        
+        generation_kwargs = self.get_gen_kwargs(sample, **kwargs)
 
         request_out = await super().inference(sample, **generation_kwargs)
         if 'input_len' not in sample:
@@ -165,22 +246,64 @@ class GenerationVLLMWorker(BaseVLLMWorker):
         
         sample_rewards_futures = []
         for sample, out in zip(samples, request_out.outputs):
+            sample['modified_reward'] = None
+            sample['delimiter_not_found'] = False
             sample['output_token_ids'] = list(out.token_ids)
             sample['output_len'] = len(sample['output_token_ids'])
             sample['sample_ids'] = sample['input_token_ids'] + sample['output_token_ids']
             sample['sample_text'] = self.tokenizer.decode(sample['sample_ids'])
             sample['sample_position_ids'] = list(range(len(sample['sample_ids'])))
             # Use the remote call because verifier_pool is now a ray actor
-            sample_rewards_futures.append(self.verifier_pool.verify_balanced.remote(sample))
+            sample_rewards_futures.append(
+                self.verifier_pool.verify_balanced.remote(
+                    sample,
+                    max_gen_length=kwargs.get("max_tokens", self.engine_args.max_model_len)
+                )
+            )
+        logging.debug(f"\033[1;38;2;255;165;0mFirst sample before rewriting: \033[0m {samples[0]['sample_text']}")
 
-        samples = await asyncio.gather(*sample_rewards_futures)
-        group_rewards = np.array([s['reward'] for s in samples])
-        group_advantages = normalize_rewards(group_rewards)
-        for sample_, advantage in zip(samples, group_advantages):
-            sample_['advantage'] = advantage.item()
+        if insert_reasoning_phrases:
+            modified_samples = [deepcopy(sample) for sample in samples]
+            modified_samples = await asyncio.gather(*[rewrite_with_insert_phrase(sample, self.tokenizer) for sample in modified_samples])
+            logging.debug(f"\033[1;38;2;255;165;0mFirst sample after rewriting: \033[0m {modified_samples[0]['input']}")
+            
+            kwargs['n'] = 1
+            modified_requests_out = await asyncio.gather(*[
+                super().inference(s, **self.get_gen_kwargs(s, include_stop_str_in_output=False, **kwargs)) 
+                for s in modified_samples
+            ])
+            modified_rewards_futures = []
+            for modified_sample, sample, out in zip(modified_samples, samples, modified_requests_out):
+                modified_sample['input'] = sample['input']  # original input
+                modified_sample['sample_ids'] = modified_sample['input_token_ids'] + list(out.outputs[0].token_ids)
+                modified_sample['input_token_ids'] = sample['input_token_ids']  # original input token ids
+                modified_sample['output_token_ids'] = modified_sample['sample_ids'][len(modified_sample['input_token_ids']):]
+                modified_sample['output_len'] = len(modified_sample['output_token_ids'])
+                modified_sample['sample_text'] = self.tokenizer.decode(modified_sample['sample_ids'])
+                modified_sample['sample_position_ids'] = list(range(len(modified_sample['sample_ids'])))
+                modified_rewards_futures.append(
+                    self.verifier_pool.verify_balanced.remote(
+                        modified_sample,
+                        max_gen_length=kwargs.get("max_tokens", self.engine_args.max_model_len)
+                    )
+                )
+            logging.debug(f"\033[1;38;2;255;165;0mFirst sample after generating with rewritten input: \033[0m {modified_samples[0]['sample_text']}")
+            modified_results = await asyncio.gather(*modified_rewards_futures)
+            for s in modified_results:
+                s['modified_reward'] = s['reward']
+            final_samples = modified_results + (await asyncio.gather(*sample_rewards_futures))
+        else:
+            final_samples = await asyncio.gather(*sample_rewards_futures)
         
-        print(f"\033[38;5;201mWorker \033[0m {self.worker_id} \033[38;5;201mfinished inference with \033[0m {len(samples)} samples.")
-        return samples
+        group_rewards = np.array([s['reward'] for s in final_samples])
+        max_reward = np.max(group_rewards).item()
+        group_advantages = normalize_rewards(group_rewards)
+        for sample_, advantage in zip(final_samples, group_advantages):
+            sample_['advantage'] = advantage.item()
+            sample_['max_reward_in_group'] = max_reward
+        
+        print(f"\033[38;5;201mWorker \033[0m {self.worker_id} \033[38;5;201mfinished inference with \033[0m {len(final_samples)} samples.")
+        return final_samples
 
 
 if __name__ == "__main__":

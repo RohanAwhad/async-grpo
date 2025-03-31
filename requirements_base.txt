@@ -1,4 +1,4 @@
-ray[default]==2.42.1
+ray[default]==2.44.1
 --extra-index-url https://download.pytorch.org/whl/cu124
 torch #==2.5.1
 torchvision
@@ -7,3 +7,5 @@ rich
 numba
 tenacity
 wrapt_timeout_decorator
+sympy
+pylatexenc

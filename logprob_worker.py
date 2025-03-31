@@ -37,6 +37,7 @@ class LogprobWorker:
             model_name_or_path=model_path,
             worker_id=worker_id,
             fsdp_sharding_strategy="FULL_SHARD",
+            loss_chunksize=None,
         )
         self.worker_id = worker_id
         self.max_tokens_per_gpu = max_tokens_per_gpu
@@ -46,7 +47,6 @@ class LogprobWorker:
         self.device = next(self.model.parameters()).device
         self.registry = get_or_create_registry("logprob_vllm_registry")
         self.batching_queue = asyncio.Queue()
-        self._lock = asyncio.Lock()
         self.setup_registration()
         self._centralizer_loop = asyncio.create_task(self._centralize_inference_requests())
     
@@ -57,43 +57,21 @@ class LogprobWorker:
         except Exception as e:
             print(f"Error during registration for worker {self.worker_id}: {e}")
 
-    # async def start_centralizer_loop(self):
-    #     try:
-    #         if self._centralizer_loop:
-    #             self._centralizer_loop.cancel()
-    #             await self._centralizer_loop
-    #     except asyncio.CancelledError:
-    #         pass
-    #     self._centralizer_loop = asyncio.create_task(self._centralize_inference_requests())
-
     def free_memory(self):
-        # self.model = self.model.to("cpu")
-        # del self.model
         gc.collect()
         torch.cuda.empty_cache()
     
     async def update_weights(self, new_state_dict: dict):
-        # async with self._lock:
+        '''kill the centralizer loop before updating the weights'''
         await self.batching_queue.put(None)
         await self._centralizer_loop
-        # self.batching_queue.clear()
-        # self.batching_queue = asyncio.Queue()
-        # try:
-        #     if self._centralizer_loop:
-        #         self._centralizer_loop.cancel()
-        #         await self._centralizer_loop
-        # except asyncio.CancelledError:
-        #     pass
+        
         self.free_memory()
-        # model = AutoModelForCausalLM.from_pretrained(self.args.model_name_or_path)
-        # self.model.load_state_dict(new_state_dict, strict=False)
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 param.data = new_state_dict[name].to(param.device).to(param.dtype)
-        self.model = self.model.cuda()
         print(f"Model loaded successfully on service {self.worker_id}.")
         # self.model = setup_model(self.args, model).cuda()
-        self.device = next(self.model.parameters()).device
         self._centralizer_loop = asyncio.create_task(self._centralize_inference_requests())
         print(f"Logprob weights updated successfully on service {self.worker_id}.")
         return True
@@ -104,72 +82,54 @@ class LogprobWorker:
         but provide an asynchronous interface.
         Expected sample dict includes 'sample_ids'
         """
-        # async with self._lock:
-        #     loop = asyncio.get_running_loop()
-        #     result = await loop.run_in_executor(None, self._compute_logprobs, sample)
-        #     return result
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        try:
-            await asyncio.wait_for(self.batching_queue.put((future, sample)), timeout=100)
-            result = await asyncio.wait_for(future, timeout=100)
-        except asyncio.TimeoutError as e:
-            import traceback
-            print(f"\033[1;38;5;196mTimeout error in logprob worker inference method: {e}\033[0m")
-            print(f"\033[1;38;5;196mTraceback: {traceback.format_exc()}\033[0m")
-            print(f"\033[1;38;5;196mlength of batching queue: {self.batching_queue.qsize()}\033[0m")
-            return sample
+        self.batching_queue.put_nowait((future, sample))
+        result = await future
         return result
     
     async def _centralize_inference_requests(self):
         # current_request acts as a pending request that didn't fit in the previous batch.
-        async with self._lock:
-            current_request = None  
+        current_request = None  
+        while True:
+            # If there's no pending request, get one from the queue.
+            # Otherwise, use the one left from the previous batch.
+            current_request = await self.batching_queue.get() if current_request is None else current_request
+            if current_request is None:
+                return None
+            logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 118: \033[0m got request with length {len(current_request[1]['sample_ids'])}")
+            logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 118: \033[0m length of batching queue: {self.batching_queue.qsize()}")
+            inference_requests = [current_request]
+            total_length = len(current_request[1]['sample_ids'])
             while True:
-                # If there's no pending request, get one from the queue.
-                # Otherwise, use the one left from the previous batch.
-                current_request = await self.batching_queue.get() if current_request is None else current_request
-                if current_request is None:
-                    return None
-                logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 118: \033[0m got request with length {len(current_request[1]['sample_ids'])}")
-                logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 118: \033[0m length of batching queue: {self.batching_queue.qsize()}")
-                inference_requests = [current_request]
-                total_length = len(current_request[1]['sample_ids'])
-                while True:
-                    try:
-                        # Attempt to retrieve the next request.
-                        current_request = await asyncio.wait_for(self.batching_queue.get(), timeout=1)
-                        if current_request is None:
-                            logging.debug(f"\033[1;38;2;255;255;0m _centralize_inference_requests line 142: \033[0m received sentinel")
-                            return None
-                        logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 129: \033[0m got request with length {len(current_request[1]['sample_ids'])}")
-                        logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 129: \033[0m length of batching queue: {self.batching_queue.qsize()}")
-                        len_request = len(current_request[1]['sample_ids'])
-                        # If adding this request would exceed the maximum, break and keep it for next round.
-                        if total_length + len_request > self.max_tokens_per_gpu:
-                            logging.debug(f"\033[1;38;2;255;20;147m _centralize_inference_requests line 147: \033[0m adding this request would exceed the maximum, breaking, total_length: {total_length}, len_request: {len_request}, max_tokens_per_gpu: {self.max_tokens_per_gpu}")
-                            break
-                        # Otherwise, include it in the current batch.
-                        total_length += len_request
-                        inference_requests.append(current_request)
-                    except asyncio.TimeoutError:
-                        # Timeout: no more requests available now.
-                        logging.debug(f"\033[1;38;2;255;0;255m _centralize_inference_requests line 153: \033[0m no more items in the batching queue timeout")
-                        current_request = None
+                try:
+                    # Attempt to retrieve the next request.
+                    current_request = await asyncio.wait_for(self.batching_queue.get(), timeout=1)
+                    if current_request is None:
+                        logging.debug(f"\033[1;38;2;255;255;0m _centralize_inference_requests line 142: \033[0m received sentinel")
+                        return None
+                    logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 129: \033[0m got request with length {len(current_request[1]['sample_ids'])}")
+                    logging.debug(f"\033[1;38;2;255;165;0m _centralize_inference_requests line 129: \033[0m length of batching queue: {self.batching_queue.qsize()}")
+                    len_request = len(current_request[1]['sample_ids'])
+                    # If adding this request would exceed the maximum, break and keep it for next round.
+                    if total_length + len_request > self.max_tokens_per_gpu:
+                        logging.debug(f"\033[1;38;2;255;20;147m _centralize_inference_requests line 147: \033[0m adding this request would exceed the maximum, breaking, total_length: {total_length}, len_request: {len_request}, max_tokens_per_gpu: {self.max_tokens_per_gpu}")
                         break
-                if inference_requests:
-                    futures, samples = zip(*inference_requests)
-                    samples_with_logprobs = self._compute_logprobs(samples)
-                    logging.debug(f"\033[1;38;2;0;255;255m _centralize_inference_requests line 160: \033[0m computed samples_with_logprobs length of batch_queue: {self.batching_queue.qsize()}")
-                    for future, sample_with_logprobs in zip(futures, samples_with_logprobs):
-                        if not future.done():
-                            future.set_result(sample_with_logprobs)
-        # except Exception as e:
-        #     import traceback
-        #     print(f"\033[38;5;196mError in centralize inference requests: {e}\033[0m\n{traceback.format_exc()}\n\n")
-        #     print(f"Current request: {current_request}")
-        #     print(f"\033[38;5;196mInference requests: {inference_requests}\033[0m")
-        #     raise e
+                    # Otherwise, include it in the current batch.
+                    total_length += len_request
+                    inference_requests.append(current_request)
+                except asyncio.TimeoutError:
+                    # Timeout: no more requests available now.
+                    logging.debug(f"\033[1;38;2;255;0;255m _centralize_inference_requests line 123: \033[0m no more items in the batching queue timeout")
+                    current_request = None
+                    break
+            if inference_requests:
+                futures, samples = zip(*inference_requests)
+                samples_with_logprobs = self._compute_logprobs(samples)
+                logging.debug(f"\033[1;38;2;0;255;255m _centralize_inference_requests line 129: \033[0m computed samples_with_logprobs length of batch_queue: {self.batching_queue.qsize()}")
+                for future, sample_with_logprobs in zip(futures, samples_with_logprobs):
+                    if not future.done():
+                        future.set_result(sample_with_logprobs)
 
     def _compute_logprobs(self, samples: List[dict]) -> dict:
         """
@@ -190,6 +150,7 @@ class LogprobWorker:
         log_probs = torch.split(log_probs, sample_lens)
         for s, log_prob in zip(samples, log_probs):
             s['sample_logprobs'] = log_prob.tolist()
+        logging.debug(f"\033[1;38;2;0;255;255m _centralize_inference_requests line 153: \033[0m computed samples_with_logprobs length of {len(samples)}")
         return samples
     
 if __name__ == "__main__":
