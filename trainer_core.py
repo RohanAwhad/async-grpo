@@ -436,6 +436,13 @@ if __name__ == "__main__":
         help="Seed for InfiniteDistributedSampler, used to shuffle the data loader."
     )
 
+    parser.add_argument(
+        "--samples_per_question",
+        type=int,
+        default=32,
+        help="Number of samples per question to use in training."
+    )
+
     args = parser.parse_args()
     init_distributed_environment(args)
     model = setup_model(args)
@@ -447,7 +454,7 @@ if __name__ == "__main__":
             model, 
             optimizer,
             lr_scheduler,
-            samples_per_question=8, 
+            samples_per_question=args.samples_per_question, 
             kl_coeff=0.001,
             accelerator=accelerator,
             num_iterations=1000000,
