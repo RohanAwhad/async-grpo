@@ -11,6 +11,7 @@ To attend to these needs we have created *_Async-GRPO_*. This library allows pra
 The main innovation is the ability to start training as soon as a minibatch is ready and automatically do gradient accumulation over a whole batch.
 
 ### Features:
+- Built-in verifier 
 - Uses FSDP via Accelerate for model sharding.
 - Padding free sample packing based on Flash Attention.
 - Don't worry about minibatches: Automatic minibatching and gradient accumulation. Minibatches are built online to keep tokens per GPU at a maximum value. 
@@ -18,6 +19,7 @@ The main innovation is the ability to start training as soon as a minibatch is r
 - Chunks the logit/loss computation to reduce memory spikes during training - can do full training 70b+ models on a single 8xA100 node.
 
 ### Coming Soon
+- pipy compatibility.
 - PyNCCL weight update from the actor to the generation and reference workers - currently using Ray Object storage which doesn't use RDMA for communication.
 - Improved delayed load balancing for generation efficiency: send requests to each worker when their current load goes bellow 2x their max concurrent capacity.
 - Tensor parallel VLLM workers for long CoTs on large models >=32Billion parameters.
@@ -92,7 +94,7 @@ torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py 2>&1 | tee train
 
 the hyperparameters to be tuned are in `trainer_core.py`.
 
-# Troubleshooting
+### Troubleshooting
 
 - when a ray worker fails, the driver (the process that spawns such worker) shows unrelated errors. It's usually a module not found error in the child worker.
 - Sometimes errors happen and Ray logging handler fails to show the tracebacks, failing silently, debug printing to a file is recommended to enable visibility.
@@ -101,10 +103,6 @@ the hyperparameters to be tuned are in `trainer_core.py`.
 - `ray list actors | grep ALIVE` can be used to check if all the expected workers are running.
 - make sure you can do enough http connections on your cluster: `ulimit -n 65535`
 - Ray creates a lot of temporary files in the `/tmp` directory. You can clean them up with `rm -rf /tmp/ray`. Also, you need enough space, otherwise use `ray start --temp-dir=/dev/shm/ray` to use the shared memory as a temporary directory.
-- the verifiers sometimes take long to create since they need to install packages on other nodes where they were not created. Make sure to list them with `ray list actors | grep Ver | grep ALIVE` to check if they are all running.
-- beware of the generation max's of the model in vllm_worker, currently set to the model max's position embeddings but that might make it harder to learn in general.
-- beware of the max_tokens_per_gpu in the logprob worker, when this is beyond the capacity of the GPU it does not raise an error but just hangs and throws a timeout error.
-
 
 
 
