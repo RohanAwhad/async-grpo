@@ -257,6 +257,9 @@ def compute_grpo_loss(
     
     # KL penalty term using the improved approximation
     kl_div = compute_kl_divergence(policy_logprobs, reference_logprobs)
+    num_clamped = (torch.abs(kl_div) > 10).sum().item()
+    kl_div = torch.clamp(kl_div, min=-10, max=10)
+    debug_print(f"\033[1;38;2;255;165;0m _compute_grpo_loss line 262: \033[0m num_clamped: {num_clamped}")
     
     # Combined loss
     loss = pg_loss + kl_coeff * kl_div
