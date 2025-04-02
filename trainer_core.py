@@ -311,8 +311,8 @@ if __name__ == "__main__":
         # default="/dev/shm/qwen-2.5-3b-instruct",
         # default="/dev/shm/Qwen2.5-1.5B-Instruct",
         # default="/dev/shm/Qwen2.5-1.5B",
-        # default="/dev/shm/DeepSeek-R1-Distill-Qwen-1.5B",
-        default="/dev/shm/phi_mini_2499716",
+        default="/dev/shm/DeepSeek-R1-Distill-Qwen-1.5B",
+        # default="/dev/shm/phi_mini_2499716",
         # default="Qwen/Qwen2.5-Math-7B",
         # default="/dev/shm/phi-4",
         type=str,
@@ -323,7 +323,7 @@ if __name__ == "__main__":
     # Training Parameters
     parser.add_argument(
         "--learning_rate",
-        default=5e-6,
+        default=2e-6,
         type=float,
         # required=True,
         help="Learning rate for training."
@@ -332,7 +332,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=126, #TODO: change to 32 for a real experiment
+        default=128, #TODO: change to 32 for a real experiment
         help="Global batch size of questions per gradient step. The batch will be split among GPUs even if not divisible by the number of GPUs."
     )
 
@@ -346,7 +346,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_warmup_steps",
         type=int,
-        default=20,
+        default=10,
         help="Number of warmup steps for the scheduler."
     )
 
@@ -369,7 +369,7 @@ if __name__ == "__main__":
         "--max_tokens_per_gpu",
         type=int,
         # default=44900,
-        default=30000,
+        default=36000,
         # default=2000,
         help="Maximum number of tokens per GPU."
     )
@@ -377,8 +377,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--loss_chunksize",
         type=int,
-        default=2048,
-        # default=None,
+        # default=2048,
+        default=None,
         help="Number of tokens to process at a time for the loss computation. This avoids creating the logits matrix all at once in memory (sequence length x vocab size) which creates a really large memory spike. None means no chunking."
     )
 
@@ -394,7 +394,7 @@ if __name__ == "__main__":
         "--max_generation_tokens",
         type=int,
         default=8192,
-        help="Maximum number of tokens to generate per rollout."
+        help="Maximum number of tokens to generate per rollout. (this is on top of the prompt tokens)"
     )
 
     parser.add_argument(
