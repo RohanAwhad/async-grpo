@@ -70,7 +70,7 @@ class InfiniteDistributedSampler(Sampler):
     def __len__(self):
         return len(self.data_source) // self.world_size
 
-def get_dataloader(global_batch_size: int, path: str = "/new_data/aldo/v1_reasoning/math_simplerl_qwen_data_token_ids.jsonl"):
+def get_dataloader(global_batch_size: int, path: str = "/new_data/aldo/v1_reasoning/math_simplerl_qwen_data_token_ids.jsonl", sampler_seed: int = 37):
     dataset = JsonlDataset(path=path)
     # Compute per-device local batch size based on the global batch size and world size.
     rank = dist.get_rank()
@@ -78,8 +78,7 @@ def get_dataloader(global_batch_size: int, path: str = "/new_data/aldo/v1_reason
     local_batch_size = global_batch_size // world_size
     if rank < (global_batch_size % world_size):
         local_batch_size += 1
-
-    sampler = InfiniteDistributedSampler(dataset)
+    sampler = InfiniteDistributedSampler(dataset, seed=sampler_seed)
     return DataLoader(dataset, batch_size=local_batch_size, sampler=sampler, num_workers=4, collate_fn=lambda batch: batch)
 
 def update_vllm_worker_weights(model, accelerator, registry_actor_names=["reference_model_registry", "actor_model_registry"]):
@@ -195,7 +194,7 @@ async def train(args,
     log_rank_0("==================================================")
     # update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["generation_vllm_registry"])
     model.train()
-    dataloader = iter(get_dataloader(args.batch_size, path=args.data_path))
+    dataloader = iter(get_dataloader(args.batch_size, path=args.data_path, sampler_seed=args.infinite_sampler_seed))
     
     device = accelerator.device
     world_size = int(os.environ["WORLD_SIZE"])
@@ -428,6 +427,13 @@ if __name__ == "__main__":
         type=str,
         default="/new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter",
         help="Output directory where model checkpoints and configuration files will be saved."
+    )
+
+    parser.add_argument(
+        "--infinite_sampler_seed",
+        type=int,
+        default=37,
+        help="Seed for InfiniteDistributedSampler, used to shuffle the data loader."
     )
 
     args = parser.parse_args()
