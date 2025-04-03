@@ -130,7 +130,8 @@ class BaseVLLMWorker:
     while logprob workers enforce fixed parameters for single token generation.
     """
     def __init__(self, model_path: str, worker_id: str,
-                 tensor_parallel_size: int = 1, max_num_seqs: int = 16):
+                 tensor_parallel_size: int = 1, max_num_seqs: int = 16, overhead_seqs: int = 8):
+        self.overhead_seqs = overhead_seqs
         self.counter = 0
         self.model_path = model_path
         self.worker_id = worker_id
@@ -150,7 +151,7 @@ class BaseVLLMWorker:
             last_weights = ray.get(ray.get(self.registry.get_last_weights.remote()))
             if last_weights is not None:
                 self.update_weights(last_weights)
-            ray.get(self.registry.register.remote(service_id=self.worker_id, max_load=self.engine_args.max_num_seqs+8))
+            ray.get(self.registry.register.remote(service_id=self.worker_id, max_load=self.engine_args.max_num_seqs+self.overhead_seqs))
             print(f"Worker {self.worker_id} registered.")
         except Exception as e:
             print(f"Error during registration for worker {self.worker_id}: {e}")

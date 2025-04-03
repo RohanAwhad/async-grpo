@@ -26,13 +26,13 @@ def get_runtime_env(mode: str):
         ]
         runtime_env["excludes"] = ["*.pyc", "__pycache__"]
     elif mode == "logprob":
-        runtime_env["pip"] = [f"-r {os.path.join(os.path.dirname(__file__), 'requirements_fsdp.txt')}"]
+        runtime_env["pip"] = [f"--trusted-host download.pytorch.org -r {os.path.join(os.path.dirname(__file__), 'requirements_fsdp.txt')}"]
     return runtime_env
 
 @ray.remote
 def create_worker(mode: str, model_path: str, tensor_parallel_size: int=1, max_num_seqs: int=1,
                     global_num_verifiers: int = 100, max_tokens_per_gpu: int = 23000,
-                    write_failed_generation_samples: bool = False):
+                    write_failed_generation_samples: bool = False, overhead_seqs: int = 8):
     """
     Instantiate the appropriate worker on the remote process after the runtime environment
     is set up. This defers the import of worker-specific modules to the worker process.
@@ -51,7 +51,8 @@ def create_worker(mode: str, model_path: str, tensor_parallel_size: int=1, max_n
             tensor_parallel_size=tensor_parallel_size,
             max_num_seqs=max_num_seqs,
             global_num_verifiers=global_num_verifiers,
-            write_failed=write_failed_generation_samples
+            write_failed=write_failed_generation_samples,
+            overhead_seqs=overhead_seqs
         )
     elif mode == "logprob":
         from logprob_worker import LogprobWorker  # lazy import on remote worker
@@ -89,6 +90,8 @@ if __name__ == "__main__":
                         help="Number of verifier workers for the global verifier pool")
     parser.add_argument("--write_failed_generation_samples", action="store_true",
                         help="If set, writing failed generation samples to file will be enabled. Do this only on a single node. Clusters with s3fs will corrupt the file.")
+    parser.add_argument("--overhead_seqs", type=int, default=8,
+                        help="Number of sequences to send to each worker over the limit")
     args = parser.parse_args()
 
     # Initialize Ray.
@@ -113,7 +116,8 @@ if __name__ == "__main__":
         max_num_seqs=args.max_num_seqs,
         max_tokens_per_gpu=args.max_tokens_per_gpu,
         global_num_verifiers=args.global_num_verifiers,
-        write_failed_generation_samples=args.write_failed_generation_samples
+        write_failed_generation_samples=args.write_failed_generation_samples,
+        overhead_seqs=args.overhead_seqs
     ))
 
     print(f"Worker {worker} created.")
