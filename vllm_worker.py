@@ -150,7 +150,7 @@ class BaseVLLMWorker:
             last_weights = ray.get(ray.get(self.registry.get_last_weights.remote()))
             if last_weights is not None:
                 self.update_weights(last_weights)
-            ray.get(self.registry.register.remote(service_id=self.worker_id, max_load=self.engine_args.max_num_seqs*2))
+            ray.get(self.registry.register.remote(service_id=self.worker_id, max_load=self.engine_args.max_num_seqs+8))
             print(f"Worker {self.worker_id} registered.")
         except Exception as e:
             print(f"Error during registration for worker {self.worker_id}: {e}")
