@@ -196,10 +196,10 @@ class BaseVLLMWorker:
 @ray.remote
 class GenerationVLLMWorker(BaseVLLMWorker):
     def __init__(self, model_path: str, worker_id: str, tensor_parallel_size: int, max_num_seqs: int,
-                 global_num_verifiers: int = 4, write_failed: bool = False):
+                 global_num_verifiers: int = 4, write_failed: bool = False, overhead_seqs: int = 8):
         # Pass the common parameters to the base initializer.
         self.verifier_pool = get_or_create_verifier_pool(global_num_verifiers, write_failed)
-        super().__init__(model_path, worker_id, tensor_parallel_size, max_num_seqs)
+        super().__init__(model_path, worker_id, tensor_parallel_size, max_num_seqs, overhead_seqs)
     
     def get_engine_args(self, model_path: str, tensor_parallel_size: int, max_num_seqs: int) -> AsyncEngineArgs:
         from transformers import AutoConfig
