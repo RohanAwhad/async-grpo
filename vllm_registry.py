@@ -8,7 +8,7 @@ import time
 DEBUG = False
 def debug_log(message: str):
     if DEBUG:
-        # Retrieve the current actor’s unique ID.
+        # Retrieve the current actor's unique ID.
         try:
             current_actor_id = ray.get_runtime_context().get_actor_id()
         except Exception as e:
@@ -24,14 +24,17 @@ class VLLMRegistry:
         # Mapping from unique service IDs to actor names.
         self.actors = {}
         self.actor_current_load = defaultdict(int)
+        self.actor_thresholds = {}  # new: track max load for each worker
         self.balancer_lock = asyncio.Condition(asyncio.Lock())
         self.last_weights = ray.put(None)
 
-    async def register(self, service_id: str):
+    async def register(self, service_id: str, max_load: int = 2**31-1):
         async with self.balancer_lock:
             self.actors[service_id] = service_id
+            self.actor_thresholds[service_id] = max_load  # store max load threshold
+            self.actor_current_load[service_id] = 0
             self.balancer_lock.notify_all()
-            return f"{service_id} registered."
+            return f"{service_id} registered with threshold {max_load}."
 
     async def deregister(self, service_id: str):
         async with self.balancer_lock:
@@ -40,6 +43,7 @@ class VLLMRegistry:
                 ray.kill(actor_handle, no_restart=False)
                 self.actors.pop(service_id, None)
                 self.actor_current_load.pop(service_id, None)
+                self.actor_thresholds.pop(service_id, None)  # new: remove threshold info
             return f"{service_id} deregistered."
     
     def get_last_weights(self):
@@ -54,19 +58,18 @@ class VLLMRegistry:
     
     async def acquire_actor(self, num_requests: int) -> str:
         async with self.balancer_lock:
-            # Wait until there is an actor available
-            while len(self.actors) == 0:
-                '''If no actor is available, wait until an actor is registered
-                   Note that the balancer_lock is released when waiting on the condition variable'''
+            while True:
+                available_actors = [s for s in self.actors if self.actor_current_load[s] + num_requests <= self.actor_thresholds[s]]
+                if available_actors:
+                    chosen_server = min(available_actors, key=lambda s: self.actor_current_load[s])
+                    self.actor_current_load[chosen_server] += num_requests
+                    return chosen_server
                 await self.balancer_lock.wait()
-                    
-            chosen_server = min(self.actors.keys(), key=lambda s: self.actor_current_load[s])
-            self.actor_current_load[chosen_server] += num_requests
-            return chosen_server
 
     async def release_actor(self, service_id: str, num_requests: int, error: bool = False):
         async with self.balancer_lock:
             self.actor_current_load[service_id] -= num_requests
+            self.balancer_lock.notify_all()
 
     async def inference_balanced(self, 
                                  sample: dict, 
