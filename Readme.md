@@ -19,7 +19,7 @@ The main innovation is the ability to start training as soon as a minibatch is r
 - Chunks the logit/loss computation to reduce memory spikes during training - can do full training 70b+ models on a single 8xA100 node.
 
 ### Coming Soon
-- pipy compatibility.
+- PyPI package releases.
 - PyNCCL weight update from the actor to the generation and reference workers - currently using Ray Object storage which doesn't use RDMA for communication.
 - Improved delayed load balancing for generation efficiency: send requests to each worker when their current load goes bellow 2x their max concurrent capacity.
 - Tensor parallel VLLM workers for long CoTs on large models >=32Billion parameters.
