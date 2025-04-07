@@ -1,6 +1,20 @@
 # Async GRPO
 
-Ray-Based Asynchronous implementation of [Group Reward Policy Optimization](https://arxiv.org/pdf/2402.03300).
+Fast and scalable Ray-Based Asynchronous implementation of [Group Reward Policy Optimization](https://arxiv.org/pdf/2402.03300).
+
+## High Performance and Accurate
+
+At the time of writting (april 7th 2025), we benchmarked our library against verl and trl and got a 40% throughput improvement against [Verl](https://github.com/volcengine/verl) and >10x against [TRL](https://github.com/huggingface/trl/blob/main/trl/trainer/grpo_trainer.py#L98).
+
+NOTE: experiments done on 2 8xH100 nodes, we used the same setup as [Deepscaler](https://github.com/agentica-project/deepscaler/) to test our library on both accuracy and throughput.
+
+![](Steps-per-Hour.svg)
+
+We also ran the deepscaler setup for the first 200k steps and got a matching reward plot to prove our library works as intended.
+
+![](experiment_plots.svg)
+
+## Introduction
 
 With the advent of reasoning models and inference time scaling generation lengths are dramatically increasing, creating a huge bottleneck for reinforcement learning in general and for GRPO in particular. Current implementations of GRPO such as [HuggingFace's](https://github.com/huggingface/trl/blob/main//docs/source/grpo_trainer.md) or [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF?tab=readme-ov-file) lead to high GPU idle time by synchronously alternating between generation and training. 
 
@@ -9,6 +23,8 @@ To attend to these needs we have created *_Async-GRPO_*. This library allows pra
 ![](async-grpo.drawio.svg)
 
 The main innovation is the ability to start training as soon as a minibatch is ready and automatically do gradient accumulation over a whole batch.
+
+The codebase is designed to be extremely modular and easy to hack, handling workload using Ray workers with simple custom load balancing workers.
 
 ### Features:
 - Built-in verifier 
