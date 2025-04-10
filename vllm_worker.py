@@ -196,9 +196,10 @@ class BaseVLLMWorker:
 @ray.remote
 class GenerationVLLMWorker(BaseVLLMWorker):
     def __init__(self, model_path: str, worker_id: str, tensor_parallel_size: int, max_num_seqs: int,
-                 global_num_verifiers: int = 4, write_failed: bool = False, overhead_seqs: int = 8):
+                 global_num_verifiers: int = 4, write_failed: bool = False, overhead_seqs: int = 8, enable_prefix_caching: bool = True):
         # Pass the common parameters to the base initializer.
         self.verifier_pool = get_or_create_verifier_pool(global_num_verifiers, write_failed)
+        self.enable_prefix_caching = enable_prefix_caching
         super().__init__(model_path, worker_id, tensor_parallel_size, max_num_seqs, overhead_seqs)
     
     def get_engine_args(self, model_path: str, tensor_parallel_size: int, max_num_seqs: int) -> AsyncEngineArgs:
@@ -209,7 +210,7 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=0.98,
             dtype=torch.bfloat16,
-            enable_prefix_caching=True,
+            enable_prefix_caching=self.enable_prefix_caching,
             max_num_seqs=max_num_seqs,
             max_model_len=config.max_position_embeddings,
             disable_log_requests=False,
