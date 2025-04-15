@@ -105,7 +105,7 @@ def get_input_for_logprobs(batched_questions, output_indices, device):
     labels[:, output_indices+1] = batch_ids[:, output_indices+1]
     return batch_ids, batch_position_ids, labels
 
-def post_process_batch(batched_questions, device):
+def post_process_batch(batched_questions, device, constant_length_samples=None):
     output_indices, output_lens = get_output_logits_indices(batched_questions, device)
     modified_samples = [q for q in batched_questions if q['modified_reward'] is not None]
     non_modified_samples = [q for q in batched_questions if q['modified_reward'] is None]
@@ -126,7 +126,12 @@ def post_process_batch(batched_questions, device):
     # print("\033[1;91;40mDEBUG using sample lens (not outputlens to broadcast)\033[0m")
     sample_lens = np.array([s['input_len'] +s['output_len'] for s in batched_questions])
     advantages = torch.from_numpy(broadcast_values(advantages, sample_lens)).to(device).to(torch.float32)
-    output_lens_broadcasted = torch.from_numpy(broadcast_values(output_lens, sample_lens)).to(device).to(torch.float32)
+    
+    if constant_length_samples is None:
+        output_lens_broadcasted = torch.from_numpy(broadcast_values(output_lens, sample_lens)).to(device).to(torch.float32)
+    else:
+        output_lens_broadcasted = torch.ones_like(advantages).to(device).to(torch.float32) * constant_length_samples
+
     # if any(s['sample_logprobs'] is None for s in batched_questions)\
     #       or any(torch.tensor(s['sample_logprobs']).ndim == 0 for s in batched_questions):
     #     torch.distributed.breakpoint(dist.get_rank())

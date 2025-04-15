@@ -132,15 +132,16 @@ def save_model(args, model, accelerator, samples_seen):
         tokenizer.save_pretrained(output_dir)
         log_rank_0(f"\033[1;38;2;0;255;255mSaved model at\033[0m {samples_seen} samples in {time.time() - start:.2f} seconds")
 
-async def remote_queue_batch_generator(global_rank: int, 
+async def remote_queue_batch_generator(global_rank: int,
                                        device: torch.device,
-                                       batcher_actor_name: str = "experience_batcher"):
+                                       batcher_actor_name: str = "experience_batcher",
+                                       constant_length_samples: int | None = None):
     batcher_actor = ray.get_actor(batcher_actor_name)
     while True:
         batch = await batcher_actor.get_batch.remote(global_rank)
         if batch is None:
             break
-        yield post_process_batch(batch, device)
+        yield post_process_batch(batch, device, constant_length_samples=constant_length_samples)
 
 def scale_model_gradients(model, total_samples_in_batch, num_samples_per_question):
     """
@@ -176,6 +177,7 @@ async def train(args,
                 accelerator: Accelerator,
                 num_iterations,
                 num_batches_per_ref_model_update,
+                constant_length_samples,
                 ):
     """
     Main training loop following Algorithm 1 from the paper.
@@ -229,9 +231,10 @@ async def train(args,
 
             # Initialize a Metrics instance for accumulating minibatch metrics
             batch_totals.reset_batch()
-            async for minibatch in remote_queue_batch_generator(args.global_rank, 
+            async for minibatch in remote_queue_batch_generator(args.global_rank,
                                                                 device,
-                                                                batcher_actor_name=args.experience_batcher_name):
+                                                                batcher_actor_name=args.experience_batcher_name,
+                                                                constant_length_samples=constant_length_samples):
                 loss, loss_metrics, pg_loss, kl_div = compute_grpo_loss(
                     policy_model,
                     minibatch,
@@ -443,6 +446,13 @@ if __name__ == "__main__":
         help="Number of samples per question to use in training."
     )
 
+    parser.add_argument(
+        "--constant_length_samples",
+        type=int,
+        default=None,
+        help="If set, forces all samples to be treated as having this output length for broadcasting advantages and other values. Defaults to None (use actual output lengths)."
+    )
+
     args = parser.parse_args()
     init_distributed_environment(args)
     model = setup_model(args)
@@ -459,6 +469,7 @@ if __name__ == "__main__":
             accelerator=accelerator,
             num_iterations=1000000,
             num_batches_per_ref_model_update=40,
+            constant_length_samples=args.constant_length_samples,
         )
     )
 
