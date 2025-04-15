@@ -39,11 +39,11 @@ def get_fsdp_config(args, model: PreTrainedModel):
             },
         ),
         limit_all_gathers=True,
-        mixed_precision_policy=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
+        # mixed_precision_policy=MixedPrecision(
+        #     param_dtype=torch.bfloat16,
+        #     reduce_dtype=torch.bfloat16,
+        #     buffer_dtype=torch.bfloat16,
+        # ),
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         sharding_strategy=ShardingStrategy[args.fsdp_sharding_strategy],
         # sync_module_states=True,
@@ -60,6 +60,7 @@ def get_fsdp_config(args, model: PreTrainedModel):
 def setup_accelerator(args, model: PreTrainedModel):
     accelerator = Accelerator(
         fsdp_plugin=get_fsdp_config(args, model),
+        mixed_precision="bf16",
     )
     accelerator.even_batches = False
     return accelerator
