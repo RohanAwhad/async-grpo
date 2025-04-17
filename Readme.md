@@ -6,13 +6,13 @@ Fast and scalable Ray-Based Asynchronous implementation of [Group Reward Policy 
 
 At the time of writting (april 7th 2025), we benchmarked our library against verl and trl and got a 40% throughput improvement against [Verl](https://github.com/volcengine/verl) and >10x against [TRL](https://github.com/huggingface/trl/blob/main/trl/trainer/grpo_trainer.py#L98). For more information and steps to reproduce, please read the detailed blog post [here](https://ai-innovation.team/blog/async-grpo-blog).
 
-NOTE: experiments done on 2 8xH100 nodes, we used the same setup as [Deepscaler](https://github.com/agentica-project/deepscaler/) to test our library on both accuracy and throughput.
+NOTE: experiments done on 2 8xH100 nodes, we used the same setup as [DeepScaleR](https://github.com/agentica-project/deepscaler/) to test our library on both accuracy and throughput.
 
-![](Steps-per-Hour.svg)
+![](figs/Steps-per-Hour.svg)
 
-We also ran the deepscaler setup for the first 200k steps and got a matching reward plot to prove our library works as intended.
+We also ran the DeepScaleR setup for the first 200k steps and got a matching reward plot to prove our library works as intended.
 
-![](experiment_plots.svg)
+![](figs/experiment_plots.svg)
 
 ## Introduction
 
@@ -20,7 +20,7 @@ With the advent of reasoning models and inference time scaling generation length
 
 To attend to these needs we have created *_Async-GRPO_*. This library allows practioners to flexibly scale and independently schedule training and inference across multiple GPUs (regardless of number of nodes) while asynchronously going through the three main stages of GRPO: 1. Actor Roll out Generation, 2. Reference Log Probabilities Inference and 3. Actor training.
 
-![](async-grpo.drawio.svg)
+![](figs/async-grpo.drawio.svg)
 
 The main innovation is the ability to start training as soon as a minibatch is ready and automatically do gradient accumulation over a whole batch.
 
@@ -138,7 +138,7 @@ set max_tokens_per_gpu 80000
 set loss_chunksize 2048
 set temperature 0.6
 set max_generation_tokens 8192
-set data_path = sample-data/deepscaler.jsonl
+set data_path = sample-data/deepscaler_r1_qwen1.5b.jsonl
 set min_samples_per_checkpoint 30000
 ```
 
@@ -153,6 +153,22 @@ set min_samples_per_checkpoint 30000
 - Ray creates a lot of temporary files in the `/tmp` directory. You can clean them up with `rm -rf /tmp/ray`. Also, you need enough space, otherwise use `ray start --temp-dir=/dev/shm/ray` to use the shared memory as a temporary directory.
 
 
+## Customization
+
+### Data Input
+We expect passed-in data to be in a JSONL format, with two required fields:
+ - `input_token_ids`: The token ids for the desired input prompts to be used during rollout generation. This should be your final, processed prompt(with chat template applied if necessary).
+  - `input`: The string input for the desired prompts to be used during rollout generation, essentially the decoded version of `input_token_ids`. Note that this field name is only strictly necessary when using our default verifier. A custom verifier could also reference any custom field name.
+ - `answer`: The ground truth answer to be compared against in the reward function / verifier. Note that this field name is only strictly necessary when using our default verifier. A custom verifier could also reference any custom field name.
+
+### Custom Reward Functions
+To add your own custom verifiers or reward calculations, everything is currently self-contained in `verifier_pool.py`. Specifically, in [vllm_worker.py](https://github.com/Red-Hat-AI-Innovation-Team/async-grpo/blob/ff89a64d141d6e6e0eabeb524a030138713b759c/vllm_worker.py#L260), you can see the function `verify_balanced` is being called with an input of a sample dict (input, output, gt answer, and any other fields included in the original data) to get the updated sample with calculated reward.
+
+To add your own reward function, you will essentially need to modify two things:
+ - Add a new verifier(s) function to the `VerifierWorker` object.
+ - Adjust the `verify_balanced` function in the `VerifierPool` to call the new verifier(s).
+
+Any number of verifiers can be added and called, as long as the final reward is updated for the returned sample.
 
 # Architecture Explanation
 
