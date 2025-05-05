@@ -14,6 +14,7 @@ def debug_print(message):
             f.write(message + "\n")
     print(message)
 
+
 def make_grpo_forward(model, loss_chunksize: int = None):
     def _forward(
         input_ids: torch.LongTensor = None,
@@ -65,15 +66,18 @@ def make_grpo_forward(model, loss_chunksize: int = None):
         # shift labels by one to the left so input_ids[0] predicts labels[1] and pad with -100 on the right since the last input_id doesn't correspond to any label.
         shifted_labels = nn.functional.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
         total_loss = []
+        all_logits = []
 
         for i in range(0, T, loss_chunksize):
             end_idx = min(i + loss_chunksize, T)
             logits = model.lm_head(hidden_states[:, i:end_idx, :]).float()
-            loss = model.loss_function(logits=logits, labels=shifted_labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
+            loss, logits = model.loss_function(logits=logits, labels=shifted_labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
             total_loss.append(loss)
+            all_logits.append(logits.detach().cpu())
 
         return CausalLMOutputWithPast(
             loss=torch.cat(total_loss, dim=0),
+            logits=torch.cat(all_logits, dim=0), #PerTokenLogProbsFromCE returns logits of shape (seq_len, vocab_size)
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -105,12 +109,13 @@ def PerTokenLogProbsFromCE(
 
     # Flatten the tokens
     logits = logits.view(-1, vocab_size)
+    
     labels = labels.view(-1)
     # Enable model parallelism
     labels = labels.to(logits.device)
     per_token_ce = nn.functional.cross_entropy(logits, labels, reduction="none", ignore_index=ignore_index)
     logprobs = -per_token_ce
-    return logprobs
+    return logprobs, logits
 
 # def get_per_token_logps(model, batched_samples_ids, batched_samples_position_ids, batched_samples_output_indices):
 #     """
@@ -177,6 +182,22 @@ def get_mean_per_sample_loss(loss, output_lens_broadcasted, num_samples):
     """
     return (loss/output_lens_broadcasted).sum()/num_samples
 
+def entropy_from_logits(logits: torch.Tensor, device: torch.device, chunk_size: int = 2048):
+    """Calculate entropy from logits."""
+    entropy = []
+    for i in range(0, logits.shape[0], chunk_size):
+        end_idx = min(i + chunk_size, logits.shape[0])
+        chunk_logits = logits[i:end_idx].to(device)
+        pd = torch.nn.functional.softmax(chunk_logits, dim=-1)
+        entropy.append(torch.logsumexp(chunk_logits, dim=-1) - torch.sum(pd * chunk_logits, dim=-1))
+    return torch.cat(entropy, dim=0)
+
+def compute_mean_entropy(logits: torch.Tensor, output_indices: torch.Tensor, chunk_size: int = 2048):
+    """Compute the mean entropy of the logits over the output indices."""
+    with torch.no_grad():
+        entropy = entropy_from_logits(logits, output_indices.device, chunk_size)
+        return entropy[output_indices].mean()
+
 # @torch.compile
 def compute_grpo_loss(
     policy_model,
@@ -215,7 +236,6 @@ def compute_grpo_loss(
     )
 
     policy_logprobs = model_out.loss
-
     ##### DEBUG #####
     # minibatch['samples'][0].keys()
     # minibatch['samples'][1]['sample_text']
@@ -267,8 +287,8 @@ def compute_grpo_loss(
     loss_metrics = (loss.detach()/output_lens_broadcasted).sum().item()
     pg_loss_metrics = (pg_loss.detach()/output_lens_broadcasted).sum().item()
     kl_div_metrics = (kl_div.detach()/output_lens_broadcasted).sum().item()
-
+    entropy_metrics = compute_mean_entropy(model_out.logits, output_indices)
     loss = (loss/output_lens_broadcasted).sum()
-    # torch.distributed.breakpoint()
+    torch.distributed.breakpoint()
 
-    return loss, loss_metrics, pg_loss_metrics, kl_div_metrics
+    return loss, loss_metrics, pg_loss_metrics, kl_div_metrics, entropy_metrics

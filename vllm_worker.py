@@ -255,6 +255,7 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             sample['sample_ids'] = sample['input_token_ids'] + sample['output_token_ids']
             sample['sample_text'] = self.tokenizer.decode(sample['sample_ids'])
             sample['sample_position_ids'] = list(range(len(sample['sample_ids'])))
+            sample['truncated_sample'] = sample['sample_ids'][-1] != self.tokenizer.eos_token_id
             # Use the remote call because verifier_pool is now a ray actor
             sample_rewards_futures.append(
                 self.verifier_pool.verify_balanced.remote(
@@ -303,6 +304,7 @@ class GenerationVLLMWorker(BaseVLLMWorker):
         for sample_, advantage in zip(final_samples, group_advantages):
             sample_['advantage'] = advantage.item()
             sample_['max_reward_in_group'] = max_reward
+            sample_['advantage_is_zero'] = advantage == 0
         
         print(f"\033[38;5;201mWorker \033[0m {self.worker_id} \033[38;5;201mfinished inference with \033[0m {len(final_samples)} samples.")
         return final_samples
@@ -310,43 +312,50 @@ class GenerationVLLMWorker(BaseVLLMWorker):
 
 if __name__ == "__main__":
     ray.init(address="auto", namespace="test")
-    parser = argparse.ArgumentParser(description="Start vLLM worker service")
+    import nest_asyncio
+    nest_asyncio.apply()
+    parser = argparse.ArgumentParser(description="Start vLLM generation worker service")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model weights")
     parser.add_argument("--tensor_parallel_size", type=int, default=1, help="Number of tensor parallel units")
     parser.add_argument("--max_num_seqs", type=int, default=16, help="Maximum number of sequences to generate")
-    parser.add_argument("--mode", type=str, required=True, choices=["generation", "logprob"], help="Worker mode: generation or logprob")
-    parser.add_argument("--num_verifiers", type=int, default=4,
-                        help="Number of verifier workers")
+    parser.add_argument("--global_num_verifiers", "--num_verifiers", dest="num_verifiers", type=int, default=4, help="Number of verifier workers")
+    parser.add_argument("--write_failed", action="store_true", help="Write failed generation samples to file")
+    parser.add_argument("--overhead_seqs", type=int, default=8, help="Number of extra sequences to send over the limit")
+    parser.add_argument("--enable_prefix_caching", type=lambda x: x.lower()=="true", default=True, help="Enable prefix caching for the generation worker")
     args = parser.parse_args()
-    
-    service_id = f"vllm_worker_{str(uuid.uuid4())}"
-    if args.mode == "logprob":
-        worker = LogprobVLLMWorker.options(
-            name=service_id,
-            num_gpus=args.tensor_parallel_size,
-            num_cpus=4,
-        ).remote(args.model_path, service_id, args.tensor_parallel_size, args.max_num_seqs)
-    elif args.mode == "generation":
-        worker = GenerationVLLMWorker.options(
-            name=service_id,
-            num_gpus=args.tensor_parallel_size,
-            num_cpus=4,
-            runtime_env={
-                "pip": [f"vllm --extra-index-url https://wheels.vllm.ai/nightly"]
-            },
-        ).remote(
-            args.model_path,
-            service_id,
-            args.tensor_parallel_size,
-            args.max_num_seqs,
-            args.num_verifiers,
-            args.write_failed
-        )
-    else:
-        raise ValueError(f"Invalid mode: {args.mode}")
-    
+
+    # Prepare runtime_env for the worker (as seen in worker_dispatcher.py)
+    runtime_env = {"env_vars": dict(os.environ)}
+    # Remove CUDA device pinning from the environment
+    runtime_env["env_vars"].pop("CUDA_VISIBLE_DEVICES", None)
+    # Install vllm and verifier dependencies
+    runtime_env["pip"] = [
+        f"-r {os.path.join(os.path.dirname(__file__), 'requirements_vllm.txt')}",
+        "math-verify[antlr4_13_2]"
+    ]
+    runtime_env["excludes"] = ["*.pyc", "__pycache__"]
+
+    # Spawn the GenerationVLLMWorker actor with dispatcher-style options
+    service_id = f"generation_worker_{uuid.uuid4()}"
+    worker = GenerationVLLMWorker.options(
+        name=service_id,
+        num_gpus=args.tensor_parallel_size,
+        num_cpus=1,
+        max_restarts=-1,
+        runtime_env=runtime_env
+    ).remote(
+        model_path=args.model_path,
+        worker_id=service_id,
+        tensor_parallel_size=args.tensor_parallel_size,
+        max_num_seqs=args.max_num_seqs,
+        global_num_verifiers=args.num_verifiers,
+        write_failed=args.write_failed,
+        overhead_seqs=args.overhead_seqs,
+        enable_prefix_caching=args.enable_prefix_caching
+    )
+
+    registry_name = "generation_vllm_registry"
     # Wait for the registry to be available.
-    registry_name = "generation_vllm_registry" if args.mode == "generation" else "logprob_vllm_registry"
     while True:
         try:
             ray.get_actor(registry_name)
@@ -355,45 +364,51 @@ if __name__ == "__main__":
         except Exception:
             print(f"{registry_name} not found, sleeping for 1 second...")
             time.sleep(1)
-    
+
     async def main():
-        input_ids = [
-            100264, 882, 100266, 4438, 1053, 499, 12849, 279, 8286, 315,
-            264, 6211, 1903, 315, 279, 11552, 315, 1403, 66818, 315,
-            279, 1890, 10801, 1405, 279, 19169, 72359, 449, 279, 7479,
-            315, 279, 1023, 26436, 30, 100265, 100264, 78191, 100266
+        # Define prefix token IDs and decode to text prompt
+        prompt_text = "How would you compute the volume of a shape made of the union of two spheres of the same radius where the centers coincide with the surface of the other sphere?"
+        messages = [
+            # {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt_text}
         ]
+        # input_ids = [
+        #     100264, 882, 100266, 4438, 1053, 499, 12849, 279, 8286, 315,
+        #     264, 6211, 1903, 315, 279, 11552, 315, 1403, 66818, 315,
+        #     279, 1890, 10801, 1405, 279, 19169, 72359, 449, 279, 7479,
+        #     315, 279, 1023, 26436, 30, 100265, 100264, 78191, 100266
+        # ]
+        # # Build tokenizer and prompt text
+        # prompt_text = tokenizer.decode(input_ids)
+        # Prepare sample for generation (with trailing token) and for registry
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False)
+        input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        gen_ids = input_ids
+        gen_text = tokenizer.decode(gen_ids)
+        sample_gen = {'input': gen_text, 'input_token_ids': gen_ids}
+        sample_reg = {'input': prompt_text, 'input_token_ids': input_ids}
+
         actor = ray.get_actor(service_id)
-        result1 = await actor.inference.remote({'input_token_ids': input_ids + [100264]})
-        result2 = await actor.inference.remote({'input_token_ids': input_ids + [100264]})
+        result1 = await actor.inference.remote(sample=sample_gen, max_tokens=100)
+        result2 = await actor.inference.remote(sample=sample_gen, max_tokens=100)
 
         registry = get_or_create_registry(registry_name)
-        tasks = [registry.inference_balanced.remote({'input_token_ids': input_ids}) for _ in range(2)]
+        tasks = [registry.inference_balanced.remote(sample_reg) for _ in range(2)]
         results = await asyncio.gather(*tasks)
         return result1, result2, results
     
     results = asyncio.run(main())
     print(results)
-    
+    from IPython import embed
+    embed()
+    # Keep the worker process alive.
     while True:
         time.sleep(10000)
-
 '''
 Usage example:
-mamba activate ray
-for i in (seq 0 7)
-    if test $i -lt 6
-        set mode "generation"
-        set max_num_seqs 8
-        echo -e "\033[32mLaunching $mode actor on GPU $i with max_num_seqs $max_num_seqs\033[0m"
-        env CUDA_VISIBLE_DEVICES="$i" python vllm_worker.py --model_path /dev/shm/phi-4 --mode $mode --tensor_parallel_size 1 --max_num_seqs $max_num_seqs &
-    else
-        # CUDA_VISIBLE_DEVICES="$i" python logprob_worker.py --model_path /dev/shm/phi-4 &
-        CUDA_VISIBLE_DEVICES="$i" torchrun --nproc_per_node=1 --master_port=1234$i logprob_worker.py --model_path /dev/shm/phi-4 &
-    end
-end
-set i 6
-mamba activate grpo
-CUDA_VISIBLE_DEVICES="$i" python logprob_worker.py --model_path /dev/shm/phi-4 &
-torchrun --nproc_per_node=8 --master_port=12345 logprob_worker.py --model_path /dev/shm/phi-4
+  # Activate the Ray environment and launch one generation worker
+  mamba activate ray
+  CUDA_VISIBLE_DEVICES=0 python vllm_worker.py --model_path Qwen/Qwen2.5-1.5B-Instruct --tensor_parallel_size 1 --max_num_seqs 64 --global_num_verifiers 10 --overhead_seqs 8 --enable_prefix_caching true
 '''
+
