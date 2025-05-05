@@ -103,43 +103,57 @@ Finally, the last step is to launch the training on the remaining GPUs. In this 
 
 ```bash
 conda create grpo python=3.12 -y; conda activate grpo; pip install -r requirements_fsdp.txt; pip install -r requirements_base.txt
-torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py 2>&1 | tee train_qwen.log
+torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py --output-dir /path/to/output/dir --min-samples-per-checkpoint 30000 [OTHER_OPTIONS...] 2>&1 | tee train.log
 ```
 
 Hyperparameters can be passed as arguments or adjusted directly in `trainer_core.py`:
 ```
-    --model_name_or_path $base_model_path \
-    --learning_rate $learning_rate \
-    --batch_size $batch_size \
-    --lr_scheduler $lr_scheduler \
-    --num_warmup_steps $num_warmup_steps \
-    --fsdp_sharding_strategy $fsdp_sharding_strategy \
-    --max_tokens_per_gpu $max_tokens_per_gpu \
-    --samples_per_question $samples_per_question \
-    --loss_chunksize $loss_chunksize \
-    --temperature $temperature \
-    --max_generation_tokens $max_generation_tokens \
-    --data_path $data_path \
-    --min_samples_per_checkpoint $min_samples_per_checkpoint \
-    --output_dir $output_dir \
+--model-name-or-path <path_or_id> \\
+--learning-rate <float> \\
+--batch-size <int> \\
+--lr-scheduler <scheduler_name> \\
+--num-warmup-steps <int> \\
+--fsdp-sharding-strategy <strategy> \\
+--max-tokens-per-gpu <int> \\
+--samples-per-question <int> \\
+--loss-chunksize <int_or_None> \\
+--temperature <float> \\
+--max-generation-tokens <int> \\
+--data-path <path_to_data> \\
+--min-samples-per-checkpoint <int> \\
+--output-dir <path_to_output> \\
+--insert-reasoning-phrases / --no-insert-reasoning-phrases \\
+--infinite-sampler-seed <int> \\
+--constant-length-samples <int_or_None> \\
+--kl-coeff <float> \\
+--num-iterations <int> \\
+--num-batches-per-ref-model-update <int> \\
+--logging-level <level> \\
+... # and others, see trainer_core.py main() for full list
 ```
 
 For example, in our recent DeepScaleR reproduction, we used:
-```
-set base_model_path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-set learning_rate 2e-6
-set batch_size 128
-set samples_per_question 8
-set infinite_sampler_seed 223
-set lr_scheduler "constant_with_warmup"
-set num_warmup_steps 5
-set fsdp_sharding_strategy "SHARD_GRAD_OP"
-set max_tokens_per_gpu 80000
-set loss_chunksize 2048
-set temperature 0.6
-set max_generation_tokens 8192
-set data_path = sample-data/deepscaler_r1_qwen1.5b.jsonl
-set min_samples_per_checkpoint 30000
+```bash
+torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py \\
+    --model-name-or-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
+    --learning-rate 2e-6 \\
+    --batch-size 128 \\
+    --samples-per-question 8 \\
+    --infinite-sampler-seed 223 \\
+    --lr-scheduler constant_with_warmup \\
+    --num-warmup-steps 5 \\
+    --fsdp-sharding-strategy SHARD_GRAD_OP \\
+    --max-tokens-per-gpu 80000 \\
+    --loss-chunksize 2048 \\
+    --temperature 0.6 \\
+    --max-generation-tokens 8192 \\
+    --data-path sample-data/deepscaler_r1_qwen1.5b.jsonl \\
+    --min-samples-per-checkpoint 30000 \\
+    --output-dir /path/to/your/output/directory \\
+    --num-batches-per-ref-model-update 40 \\
+    --kl-coeff 0.001 \\
+    --num-iterations 1000000 \\
+    2>&1 | tee train_deepscaler_repro.log
 ```
 
 ### Troubleshooting
@@ -188,7 +202,7 @@ We also use [worker_dispatcher.py](worker_dispatcher.py) to dispatch the workers
 
 #### Generation Worker
 
-The generation worker ([`GenerationVLLMWorker`](vllm_worker.py)) is responsible for generating rollouts. It uses a vllm asynchronous engine to generate these rollouts, and then it utilizes HF's [math-verify](https://github.com/huggingface/Math-Verify) to compute a reward (it expects a `gt_answer` key in the sample dict). This worker also completes most of the sample dict, including defining the IDs used for reference logprobs and training (`sample_position_ids`), as well as the `advantages` used in GRPO (or the normalized rewards across a sample’s rollouts).
+The generation worker ([`GenerationVLLMWorker`](vllm_worker.py)) is responsible for generating rollouts. It uses a vllm asynchronous engine to generate these rollouts, and then it utilizes HF's [math-verify](https://github.com/huggingface/Math-Verify) to compute a reward (it expects a `gt_answer` key in the sample dict). This worker also completes most of the sample dict, including defining the IDs used for reference logprobs and training (`sample_position_ids`), as well as the `advantages` used in GRPO (or the normalized rewards across a sample's rollouts).
 
 #### Logprob Worker
 
@@ -220,7 +234,7 @@ The [train](trainer_core.py) script orchestrates the entire workflow:
 
 #### GRPO Loss Details
 
-Our GRPO loss is mathematically equivalent to that described in the original [GRPO paper](https://arxiv.org/pdf/2402.03300) — specifically, equation 19 (further simplified by having $\pi_{\theta_{\text{old}}} = \pi_\theta$, as the policy isn’t updated more than once per batch, aligning with equation 20’s gradient).
+Our GRPO loss is mathematically equivalent to that described in the original [GRPO paper](https://arxiv.org/pdf/2402.03300) — specifically, equation 19 (further simplified by having $\pi_{\theta_{\text{old}}} = \pi_\theta$, as the policy isn't updated more than once per batch, aligning with equation 20's gradient).
 
 To compute this loss:
 
@@ -235,4 +249,4 @@ To compute this loss:
    This serves as a per-token Taylor expansion approximation of the KL divergence (approximately $\pi_{\text{ref}}/\pi_\theta - \log(\pi_{\text{ref}}/\pi_\theta) - 1$). The losses are divided by the number of tokens in the output (as the RL loss is computed at the trajectory level) and summed across all samples (without averaging).
 
 4. **Scaling Adjustments:**  
-   The loss is scaled up by the number of training processes to counteract FSDP’s mean reduction, and the gradients are scaled down by the total number of samples (across all training processes) to effectively average across the batch.
+   The loss is scaled up by the number of training processes to counteract FSDP's mean reduction, and the gradients are scaled down by the total number of samples (across all training processes) to effectively average across the batch.

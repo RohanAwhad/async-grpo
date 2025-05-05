@@ -3,6 +3,8 @@ import asyncio
 import os
 from pathlib import Path
 import time
+from enum import Enum
+import json
 
 import torch
 import ray
@@ -12,9 +14,11 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 import torch.distributed as dist
 from datasets import load_dataset
 from transformers import AutoTokenizer
+from typer import Typer, Option
+
 from setup_model import setup_model, setup_training_components
 from grpo_loss import compute_grpo_loss
-from utils import init_distributed_environment, log_rank_0, setup_logger
+from utils import init_distributed_environment, log_rank_0, setup_logger, ArgsNamespace
 from sample_processing_utils import post_process_batch
 from batch_metrics import BatchMetrics
 
@@ -172,12 +176,7 @@ async def train(args,
                 policy_model, 
                 optimizer,
                 lr_scheduler,
-                samples_per_question, 
-                kl_coeff,
                 accelerator: Accelerator,
-                num_iterations,
-                num_batches_per_ref_model_update,
-                constant_length_samples,
                 ):
     """
     Main training loop following Algorithm 1 from the paper.
@@ -185,10 +184,10 @@ async def train(args,
     """
     log_rank_0("==================================================")
     log_rank_0("           TRAINING CONFIGURATION")
-    log_rank_0(f"Num Iterations                  : {num_iterations}")
-    log_rank_0(f"KL Coefficient                  : {kl_coeff}")
-    log_rank_0(f"Num Batches per Ref Model Update: {num_batches_per_ref_model_update}")
-    log_rank_0(f"Samples per Question             : {samples_per_question}")
+    log_rank_0(f"Num Iterations                  : {args.num_iterations}")
+    log_rank_0(f"KL Coefficient                  : {args.kl_coeff}")
+    log_rank_0(f"Num Batches per Ref Model Update: {args.num_batches_per_ref_model_update}")
+    log_rank_0(f"Samples per Question             : {args.samples_per_question}")
     log_rank_0("--------------------------------------------------")
     log_rank_0("           TRAINING ARGUMENTS (args)")
     for arg_key, arg_value in sorted(vars(args).items()):
@@ -207,16 +206,16 @@ async def train(args,
     batch_totals = BatchMetrics()
     
     # Outermost loop: Policy iteration
-    for iteration in range(num_iterations):
-        log_rank_0(f"Starting iteration {iteration + 1}/{num_iterations}")
+    for iteration in range(args.num_iterations):
+        log_rank_0(f"Starting iteration {iteration + 1}/{args.num_iterations}")
 
-        for step in range(num_batches_per_ref_model_update):
+        for step in range(args.num_batches_per_ref_model_update):
             start_time = time.time()
             batch = next(dataloader)
             torch.distributed.barrier()
             await batcher_actor.generate_experience.remote(
                 batch,
-                samples_per_question,
+                args.samples_per_question,
                 actor_registry="generation_vllm_registry",
                 reference_registry="logprob_vllm_registry",
                 temperature=args.temperature,
@@ -234,11 +233,11 @@ async def train(args,
             async for minibatch in remote_queue_batch_generator(args.global_rank,
                                                                 device,
                                                                 batcher_actor_name=args.experience_batcher_name,
-                                                                constant_length_samples=constant_length_samples):
+                                                                constant_length_samples=args.constant_length_samples):
                 loss, loss_metrics, pg_loss, kl_div = compute_grpo_loss(
                     policy_model,
                     minibatch,
-                    kl_coeff,
+                    args.kl_coeff,
                 )
                 # Multiply the loss by the number of GPUs to account for FSDP's mean reduction.
                 # Gradient scaling divides by the total number of samples in the batch across all GPUs.
@@ -271,7 +270,7 @@ async def train(args,
             bm = batch_totals.totals
             batch_num_samples = bm["samples"]
             total_samples_accumulated += batch_num_samples
-            grad_norm = take_gradient_step(model, optimizer, lr_scheduler, accelerator, batch_num_samples, samples_per_question)
+            grad_norm = take_gradient_step(model, optimizer, lr_scheduler, accelerator, batch_num_samples, args.samples_per_question)
 
             if accelerator.is_main_process:
                 print(
@@ -295,165 +294,107 @@ async def train(args,
                 last_saved_samples = total_samples_accumulated
             
             #update both logprob and generation workers at the last step of the ref model update loop
-            registry_actor_names = ["generation_vllm_registry", "logprob_vllm_registry"] if step == num_batches_per_ref_model_update - 1 else ["generation_vllm_registry"]
+            registry_actor_names = ["generation_vllm_registry", "logprob_vllm_registry"] if step == args.num_batches_per_ref_model_update - 1 else ["generation_vllm_registry"]
             update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=registry_actor_names)
         
         # update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["logprob_vllm_registry"])
             
 
+app = Typer(
+    pretty_exceptions_show_locals=False,  # Hide local variables in tracebacks
+    pretty_exceptions_short=True   
+)
 
-if __name__ == "__main__":
-    setup_logger()
-    parser = argparse.ArgumentParser()
+class FSDPShardingStrategyEnum(str, Enum):
+    NO_SHARD = "NO_SHARD"
+    SHARD_GRAD_OP = "SHARD_GRAD_OP"
+    FULL_SHARD = "FULL_SHARD"
+    HYBRID_SHARD = "HYBRID_SHARD"
+    _HYBRID_SHARD_ZERO2 = "_HYBRID_SHARD_ZERO2"
 
-    # Model and Tokenizer
-    parser.add_argument(
-        "--model_name_or_path",
-        # default="/dev/shm/qwen7b-math-base",
-        # default="/dev/shm/qwen-2.5-3b-instruct",
-        # default="/dev/shm/Qwen2.5-1.5B-Instruct",
-        # default="/dev/shm/Qwen2.5-1.5B",
-        default="/dev/shm/DeepSeek-R1-Distill-Qwen-1.5B",
-        # default="/dev/shm/phi_mini_2499716",
-        # default="Qwen/Qwen2.5-Math-7B",
-        # default="/dev/shm/phi-4",
-        type=str,
-        # required=True,
-        help="Path to pre-trained model or identifier from huggingface.co/models."
+class LogLevelEnum(str, Enum):
+    DEBUG = "DEBUG"
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    CRITICAL = "CRITICAL"
+
+@app.command()
+def main(
+    model_name_or_path: str = Option("/dev/shm/DeepSeek-R1-Distill-Qwen-1.5B", help="Path to pre-trained model or identifier from huggingface.co/models."),
+    learning_rate: float = Option(2e-6, help="Learning rate for training."),
+    batch_size: int = Option(128, help="Global batch size of questions per gradient step. The batch will be split among GPUs even if not divisible by the number of GPUs."),
+    lr_scheduler: str = Option("constant_with_warmup", help="Type of learning rate scheduler to use."),
+    num_warmup_steps: int = Option(10, help="Number of warmup steps for the scheduler."),
+    fsdp_sharding_strategy: FSDPShardingStrategyEnum = Option(
+        FSDPShardingStrategyEnum.SHARD_GRAD_OP, 
+        help="Sharding strategy for Fully Sharded Data Parallel.",
+        case_sensitive=False
+    ),
+    experience_batcher_name: str = Option("experience_batcher", help="Name of the experience batcher actor."),
+    max_tokens_per_gpu: int = Option(36000, help="Maximum number of tokens per GPU."),
+    loss_chunksize: int = Option(None, help="Number of tokens to process at a time for the loss computation. This avoids creating the logits matrix all at once in memory. None means no chunking."),
+    temperature: float = Option(0.6, help="Sampling temperature for generating experience."),
+    max_generation_tokens: int = Option(8192, help="Maximum number of tokens to generate per rollout."),
+    insert_reasoning_phrases: bool = Option(False, "--insert-reasoning-phrases/--no-insert-reasoning-phrases", help="Enable rewriting to insert reasoning phrases during inference."),
+    data_path: str = Option("/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_phi_mini_nemotron.jsonl", help="Path to the data file."),
+    min_samples_per_checkpoint: int = Option(30000, help="Minimum number of samples per checkpoint."),
+    output_dir: str = Option("/new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter", help="Output directory where model checkpoints and configuration files will be saved."),
+    infinite_sampler_seed: int = Option(37, help="Seed for InfiniteDistributedSampler, used to shuffle the data loader."),
+    samples_per_question: int = Option(32, help="Number of samples per question to use in training."),
+    constant_length_samples: int = Option(None, help="If set, forces all samples to be treated as having this output length for broadcasting advantages and other values. Defaults to None (use actual output lengths)."),
+    kl_coeff: float = Option(0.001, help="KL coefficient for GRPO loss."),
+    num_iterations: int = Option(1000000, help="Total number of training iterations."),
+    num_batches_per_ref_model_update: int = Option(40, help="Number of training batches before updating the reference model weights."),
+    logging_level: LogLevelEnum = Option(LogLevelEnum.INFO, help="Logging level", case_sensitive=False),
+    global_rank: int = Option(int(os.environ.get("RANK", 0)), help="Global rank of the process."), # Add global_rank from env
+):
+    """
+    Main training entry point for Async GRPO.
+    """
+    setup_logger(level=logging_level.value)
+
+    args = ArgsNamespace(
+        model_name_or_path=model_name_or_path,
+        learning_rate=learning_rate,
+        batch_size=batch_size,
+        lr_scheduler=lr_scheduler,
+        num_warmup_steps=num_warmup_steps,
+        fsdp_sharding_strategy=fsdp_sharding_strategy.value,
+        experience_batcher_name=experience_batcher_name,
+        max_tokens_per_gpu=max_tokens_per_gpu,
+        loss_chunksize=loss_chunksize,
+        temperature=temperature,
+        max_generation_tokens=max_generation_tokens,
+        insert_reasoning_phrases=insert_reasoning_phrases,
+        data_path=data_path,
+        min_samples_per_checkpoint=min_samples_per_checkpoint,
+        output_dir=output_dir,
+        infinite_sampler_seed=infinite_sampler_seed,
+        samples_per_question=samples_per_question,
+        constant_length_samples=constant_length_samples,
+        kl_coeff=kl_coeff,
+        num_iterations=num_iterations,
+        num_batches_per_ref_model_update=num_batches_per_ref_model_update,
+        global_rank=global_rank # Manually add global_rank
     )
+    
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Log parameters only on rank 0
+    if args.global_rank == 0:
+        params_to_log = args.__dict__.copy()
+        params_to_log.update({
+            "logging_level": logging_level.value,
+            "WORLD_SIZE": int(os.environ.get("WORLD_SIZE", 1))
+        })
+        params_path = output_path / f"training_params.json"
+        with open(params_path, 'w') as f:
+            json.dump(params_to_log, f, indent=4)
+        print(f"Training with parameters: {json.dumps(params_to_log, separators=(',', ':'), indent=4)}")
+        print(f"Training parameters saved to {params_path}")
 
-    # Training Parameters
-    parser.add_argument(
-        "--learning_rate",
-        default=2e-6,
-        type=float,
-        # required=True,
-        help="Learning rate for training."
-    )
-
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=128, #TODO: change to 32 for a real experiment
-        help="Global batch size of questions per gradient step. The batch will be split among GPUs even if not divisible by the number of GPUs."
-    )
-
-    # Scheduler and Optimization
-    parser.add_argument(
-        "--lr_scheduler",
-        type=str,
-        default="constant_with_warmup", # see transformers.trainer_utils.SchedulerType
-        help="Type of learning rate scheduler to use."
-    )
-    parser.add_argument(
-        "--num_warmup_steps",
-        type=int,
-        default=10,
-        help="Number of warmup steps for the scheduler."
-    )
-
-    parser.add_argument(
-        "--fsdp_sharding_strategy",
-        type=str,
-        default="SHARD_GRAD_OP",
-        choices=["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD", "HYBRID_SHARD"],
-        help="Sharding strategy for Fully Sharded Data Parallel."
-    )
-
-    parser.add_argument(
-        "--experience_batcher_name",
-        type=str,
-        default="experience_batcher",
-        help="Name of the experience batcher actor."
-    )
-
-    parser.add_argument(
-        "--max_tokens_per_gpu",
-        type=int,
-        # default=44900,
-        default=36000,
-        # default=2000,
-        help="Maximum number of tokens per GPU."
-    )
-
-    parser.add_argument(
-        "--loss_chunksize",
-        type=int,
-        # default=2048,
-        default=None,
-        help="Number of tokens to process at a time for the loss computation. This avoids creating the logits matrix all at once in memory (sequence length x vocab size) which creates a really large memory spike. None means no chunking."
-    )
-
-    # Added new argument for temperature with a default value of 1.0
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.6,
-        help="Sampling temperature for generating experience."
-    )
-
-    parser.add_argument(
-        "--max_generation_tokens",
-        type=int,
-        default=8192,
-        help="Maximum number of tokens to generate per rollout. (this is on top of the prompt tokens)"
-    )
-
-    parser.add_argument(
-        "--insert_reasoning_phrases",
-        action="store_true",
-        default=False,
-        help="Enable rewriting to insert reasoning phrases during inference."
-    )
-
-    parser.add_argument(
-        "--data_path",
-        type=str,
-        # default="/new_data/aldo/v1_reasoning/grpobk/limo_data_cleaned_phi_4_format.jsonl",
-        # default="/new_data/aldo/v1_reasoning/math_simplerl_qwen_data_token_ids.jsonl",
-        # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/countdown.jsonl",
-        # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_initial_prompt.jsonl",
-        # default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_initial_prompt_qwen1.5b_base.jsonl",
-        default="/new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_phi_mini_nemotron.jsonl",
-        help="Path to the data file."
-    )
-
-    parser.add_argument(
-        "--min_samples_per_checkpoint",
-        type=int,
-        default=30000,
-        help="Minimum number of samples per checkpoint."
-    )
-
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter",
-        help="Output directory where model checkpoints and configuration files will be saved."
-    )
-
-    parser.add_argument(
-        "--infinite_sampler_seed",
-        type=int,
-        default=37,
-        help="Seed for InfiniteDistributedSampler, used to shuffle the data loader."
-    )
-
-    parser.add_argument(
-        "--samples_per_question",
-        type=int,
-        default=32,
-        help="Number of samples per question to use in training."
-    )
-
-    parser.add_argument(
-        "--constant_length_samples",
-        type=int,
-        default=None,
-        help="If set, forces all samples to be treated as having this output length for broadcasting advantages and other values. Defaults to None (use actual output lengths)."
-    )
-
-    args = parser.parse_args()
     init_distributed_environment(args)
     model = setup_model(args)
     model, accelerator, optimizer, lr_scheduler = setup_training_components(args, model)
@@ -464,14 +405,12 @@ if __name__ == "__main__":
             model, 
             optimizer,
             lr_scheduler,
-            samples_per_question=args.samples_per_question, 
-            kl_coeff=0.001,
             accelerator=accelerator,
-            num_iterations=1000000,
-            num_batches_per_ref_model_update=40,
-            constant_length_samples=args.constant_length_samples,
         )
     )
+
+if __name__ == "__main__":
+    app()
 
 '''
 # set -x log_dir /new_data/experiments_rh/deepscaler_qwen1.5b_also_single_delimiter

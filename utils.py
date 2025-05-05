@@ -63,3 +63,12 @@ def patch_target_module(
     to_patch = ".".join(to_patch)
     source = importlib.import_module(to_patch)
     setattr(source, obj_name_to_patch, replace_with)
+
+# Simple namespace class to mimic argparse.Namespace behavior
+class ArgsNamespace:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def __repr__(self):
+        items = (f"{k}={v!r}" for k, v in self.__dict__.items())
+        return f"{type(self).__name__}({', '.join(items)})"
