@@ -21,6 +21,7 @@ from grpo_loss import compute_grpo_loss
 from utils import init_distributed_environment, log_rank_0, setup_logger, ArgsNamespace
 from sample_processing_utils import post_process_batch
 from batch_metrics import BatchMetrics
+from async_structured_logger import AsyncStructuredLogger
 
 
 class JsonlDataset(Dataset):
@@ -189,6 +190,10 @@ async def train(args,
     world_size = int(os.environ["WORLD_SIZE"])
 
     batcher_actor = ray.get_actor(args.experience_batcher_name, namespace="test")
+
+    if accelerator.is_main_process:
+        metric_logger = AsyncStructuredLogger(os.path.join(args.output_dir, f"training_metrics.jsonl"))
+
     total_samples_accumulated = 0
     last_saved_samples = 0
     batch_totals = BatchMetrics()
@@ -261,21 +266,29 @@ async def train(args,
             grad_norm = take_gradient_step(policy_model, optimizer, lr_scheduler, accelerator, batch_num_samples, args.samples_per_question)
 
             if accelerator.is_main_process:
-                print(
-                    f"\033[1;38;2;255;0;255mAverage Reward Accumulated in Batch:\033[0m {bm['reward']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
-                    f"\033[1;38;2;255;0;255mAverage Output Tokens in Batch:\033[0m {bm['output_tokens']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
-                    f"\033[1;38;2;255;0;255mAverage Loss in Batch:\033[0m {bm['loss']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
-                    f"\033[1;38;2;255;0;255mLearning Rate:\033[0m {lr_scheduler.get_last_lr()}\n"
-                    f"\033[1;38;2;255;0;255mAverage PG Loss in Batch:\033[0m {bm['pg_loss']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
-                    f"\033[1;38;2;255;0;255mAverage KL Div Accumulated in Batch:\033[0m {bm['kl_div']/batch_num_samples} \033[1;38;2;255;0;255m samples trained on:\033[0m {total_samples_accumulated}\n"
-                    f"\033[1;38;2;255;0;255mAverage Modified Reward in Batch:\033[0m {bm['modified_reward']/(bm['modified_samples']+1e-6)} \033[1;38;2;255;0;255m Num Modified Samples:\033[0m {bm['modified_samples']}\n"
-                    f"\033[1;38;2;255;0;255mAverage Delimiter Not Found in Batch:\033[0m {bm['delimiter_not_found']/(bm['modified_samples']+1e-6)}\n"
-                    f"\033[1;38;2;255;0;255mAverage Non Modified Reward in Batch:\033[0m {bm['non_modified_reward']/(batch_num_samples - bm['modified_samples'])}\n"
-                    f"\033[1;38;2;255;0;255mAverage Max Reward in Group in Batch:\033[0m {bm['max_reward_in_group']/batch_num_samples}\n"
-                    f"\033[1;38;2;255;0;255mGrad Norm:\033[0m {grad_norm} samples trained on:\033[0m {total_samples_accumulated}\n"
-                    f"\033[1;38;2;0;255;0mSamples in Current Batch:\033[0m {bm['samples']}\n"
-                    f"\033[1;38;2;255;0;255mTime taken for batch:\033[0m {time.time() - start_time:.2f} seconds\n"
-                )
+                batch_time = time.time() - start_time
+                metrics_to_log = {
+                    "step": step,
+                    "iteration": iteration,
+                    "total_samples_accumulated": total_samples_accumulated,
+                    "samples_in_batch": batch_num_samples,
+                    "avg_reward": bm['reward']/batch_num_samples,
+                    "avg_output_tokens": bm['output_tokens']/batch_num_samples,
+                    "avg_loss": bm['loss']/batch_num_samples,
+                    "lr": lr_scheduler.get_last_lr()[0],
+                    "avg_pg_loss": bm['pg_loss']/batch_num_samples,
+                    "avg_kl_div": bm['kl_div']/batch_num_samples,
+                    "avg_modified_reward": bm['modified_reward']/(bm['modified_samples']+1e-6),
+                    "num_modified_samples": bm['modified_samples'],
+                    "avg_delimiter_not_found": bm['delimiter_not_found']/(bm['modified_samples']+1e-6),
+                    "avg_non_modified_reward": bm['non_modified_reward']/(batch_num_samples - bm['modified_samples']+1e-9),
+                    "avg_max_reward_in_group": bm['max_reward_in_group']/batch_num_samples,
+                    "grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
+                    "time_per_batch": batch_time,
+                    "samples_per_second": batch_num_samples / batch_time,
+                    "peak_memory_usage_GB": float(torch.cuda.max_memory_allocated() / 1e9)
+                }
+                metric_logger.log_sync(metrics_to_log)
 
             if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
                 save_model(args, policy_model, accelerator, total_samples_accumulated)
