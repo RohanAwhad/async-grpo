@@ -182,19 +182,7 @@ async def train(args,
     Main training loop following Algorithm 1 from the paper.
     Simplified version since with μ=1, π_old = π_current during sampling.
     """
-    log_rank_0("==================================================")
-    log_rank_0("           TRAINING CONFIGURATION")
-    log_rank_0(f"Num Iterations                  : {args.num_iterations}")
-    log_rank_0(f"KL Coefficient                  : {args.kl_coeff}")
-    log_rank_0(f"Num Batches per Ref Model Update: {args.num_batches_per_ref_model_update}")
-    log_rank_0(f"Samples per Question             : {args.samples_per_question}")
-    log_rank_0("--------------------------------------------------")
-    log_rank_0("           TRAINING ARGUMENTS (args)")
-    for arg_key, arg_value in sorted(vars(args).items()):
-        log_rank_0(f"{arg_key:30s}: {arg_value}")
-    log_rank_0("==================================================")
-    # update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["generation_vllm_registry"])
-    model.train()
+    policy_model.train()
     dataloader = iter(get_dataloader(args.batch_size, path=args.data_path, sampler_seed=args.infinite_sampler_seed))
     
     device = accelerator.device
@@ -270,7 +258,7 @@ async def train(args,
             bm = batch_totals.totals
             batch_num_samples = bm["samples"]
             total_samples_accumulated += batch_num_samples
-            grad_norm = take_gradient_step(model, optimizer, lr_scheduler, accelerator, batch_num_samples, args.samples_per_question)
+            grad_norm = take_gradient_step(policy_model, optimizer, lr_scheduler, accelerator, batch_num_samples, args.samples_per_question)
 
             if accelerator.is_main_process:
                 print(
@@ -290,14 +278,13 @@ async def train(args,
                 )
 
             if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
-                save_model(args, model, accelerator, total_samples_accumulated)
+                save_model(args, policy_model, accelerator, total_samples_accumulated)
                 last_saved_samples = total_samples_accumulated
             
             #update both logprob and generation workers at the last step of the ref model update loop
             registry_actor_names = ["generation_vllm_registry", "logprob_vllm_registry"] if step == args.num_batches_per_ref_model_update - 1 else ["generation_vllm_registry"]
             update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=registry_actor_names)
         
-        # update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=["logprob_vllm_registry"])
             
 
 app = Typer(
