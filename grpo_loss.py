@@ -186,20 +186,10 @@ def get_mean_per_sample_loss(loss, output_lens_broadcasted, num_samples):
 @torch.compile
 def entropy_from_logits(logits: torch.Tensor):
     """Calculate entropy from logits."""
-    # entropy = []
-    # for i in range(0, logits.shape[0], chunk_size):
-    #     end_idx = min(i + chunk_size, logits.shape[0])
-    #     chunk_logits = logits[i:end_idx].to(device)
     with torch.no_grad():
         pd = torch.nn.functional.softmax(logits, dim=-1)
         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
     return entropy
-
-# def compute_mean_entropy(logits: torch.Tensor, output_indices: torch.Tensor, chunk_size: int = 2048):
-#     """Compute the mean entropy of the logits over the output indices."""
-#     with torch.no_grad():
-#         entropy = entropy_from_logits(logits, output_indices.device, chunk_size)
-#         return 
 
 # @torch.compile
 def compute_grpo_loss(

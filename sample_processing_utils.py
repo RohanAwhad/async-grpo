@@ -186,4 +186,6 @@ def post_process_batch(batched_questions, device, constant_length_samples=None):
         "samples": batched_questions,
         "labels": labels,
         "total_reward_rank": torch.tensor(sum([s['reward'] for s in batched_questions]), device=device, dtype=torch.float32),
+        "truncated_sample": torch.tensor(sum([s['truncated_sample'] for s in batched_questions]), device=device, dtype=torch.float32),
+        "advantage_is_zero": torch.tensor(sum([s['advantage_is_zero'] for s in batched_questions]), device=device, dtype=torch.float32),
     } 

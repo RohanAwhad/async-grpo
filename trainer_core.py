@@ -253,6 +253,8 @@ async def train(args,
                     pg_loss = pg_loss,
                     kl_div = kl_div,
                     entropy = entropy,
+                    advantage_is_zero = minibatch["advantage_is_zero"],
+                    truncated_sample = minibatch["truncated_sample"],
                 )
 
             # End async for
@@ -284,6 +286,8 @@ async def train(args,
                     "avg_delimiter_not_found": bm['delimiter_not_found']/(bm['modified_samples']+1e-6),
                     "avg_non_modified_reward": bm['non_modified_reward']/(batch_num_samples - bm['modified_samples']+1e-9),
                     "avg_max_reward_in_group": bm['max_reward_in_group']/batch_num_samples,
+                    "perc_with_0_advantage": bm['advantage_is_zero']/batch_num_samples,
+                    "perc_truncated_samples": bm['truncated_sample']/batch_num_samples,
                     "grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
                     "time_per_batch": batch_time,
                     "samples_per_second": batch_num_samples / batch_time,
@@ -350,6 +354,7 @@ def main(
     num_batches_per_ref_model_update: int = Option(40, help="Number of training batches before updating the reference model weights."),
     logging_level: LogLevelEnum = Option(LogLevelEnum.INFO, help="Logging level", case_sensitive=False),
     global_rank: int = Option(int(os.environ.get("RANK", 0)), help="Global rank of the process."), # Add global_rank from env
+    use_torch_compile: bool = Option(True, help="Use torch.compile to speed up training."),
 ):
     """
     Main training entry point for Async GRPO.
@@ -378,7 +383,8 @@ def main(
         kl_coeff=kl_coeff,
         num_iterations=num_iterations,
         num_batches_per_ref_model_update=num_batches_per_ref_model_update,
-        global_rank=global_rank # Manually add global_rank
+        global_rank=global_rank, # Manually add global_rank
+        use_torch_compile=use_torch_compile,
     )
     
     output_path = Path(output_dir)

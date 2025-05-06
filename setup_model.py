@@ -115,6 +115,9 @@ def setup_model(args, model=None):
     model = align_model_and_tokenizer(model, tokenizer)
     model = make_grpo_forward(model, args.loss_chunksize)
     model.loss_function = PerTokenLogProbsFromCE
+    if args.use_torch_compile:
+        torch.compile(model.model)
+        torch.compile(model.loss_function)
 
     if model.__class__.__name__ not in [
         "MistralForCausalLM",
