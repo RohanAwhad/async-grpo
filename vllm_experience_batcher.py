@@ -8,13 +8,17 @@ import re
 import random
 
 DEBUG = True
-# placeholder for debug file handle; will be opened inside the remote actor
-debug_file = None
+def debug_log(message: str, file_name: str = None):
+    if DEBUG:
+        print(message)
+        # compute path inside the worker's environment
+        path = file_name or os.path.join(os.getcwd(), "debug_vllm_experience_batcher.txt")
+        with open(path, "a") as _f:
+            _f.write(message + "\n")
 
 async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_handle, reference_registry_handle, temperature=1.0, max_tokens=8192, insert_reasoning_phrases=False):
-    if DEBUG:
-        debug_file.write(f"Getting experience and reference logprobs for sample: {sample['input']}\n")
-        debug_file.flush()
+    
+    debug_log(f"Getting experience and reference logprobs for sample: {sample['input']}")
     # actor_registry = ray.get_actor(actor_registry_name)
     samples = await actor_registry_handle.inference_balanced.remote(
         sample,
@@ -23,9 +27,7 @@ async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_ha
         max_tokens=max_tokens,
         insert_reasoning_phrases=insert_reasoning_phrases
     )
-    if DEBUG:
-        debug_file.write(f"Samples for {sample['input']}\n")
-        debug_file.flush()
+    debug_log(f"Samples for {sample['input']}")
     # logging.debug(f"\033[1;38;2;255;165;0mFirst sample before rewriting: \033[0m {samples[0]['sample_text']}")
     # samples = await asyncio.gather(*[rewrite_with_insert_phrase(s) for s in samples])
     
@@ -41,18 +43,12 @@ async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_ha
         s,
     ) for s in samples]
     samples_with_ref_logprobs = await asyncio.gather(*tasks)
-    if DEBUG:
-        debug_file.write(f"Samples with reference logprobs for {sample['input']}\n")
-        debug_file.flush()
+    debug_log(f"Samples with reference logprobs for {sample['input']}")
     return samples_with_ref_logprobs
 
 @ray.remote
 class ExperienceBatcher:
     def __init__(self):
-        # open debug file in the actor process
-        global debug_file
-        log_path = os.path.join(os.path.dirname(__file__), "debug_vllm_experience_batcher.txt")
-        debug_file = open(log_path, "a") if DEBUG else None
         self.training_processes_queues = {}
         self.training_batches = {}
         self.training_batches_lengths = {}
@@ -108,24 +104,20 @@ class ExperienceBatcher:
         """Continuously consumes tasks from the experience_queue and processes them."""
         async with self.lock:
             for task in asyncio.as_completed(self.experience_queue):
-                debug_file.write(f"Experience queue length in _create_batches: {len(self.experience_queue)}\n")
-                debug_file.flush()
+                debug_log(f"Experience queue length in _create_batches: {len(self.experience_queue)}")
                 samples = await task
                 if samples is None: # underlying coroutine timed out
                     continue
                 for sample in samples:
                     await self.add_sample_to_batches(sample)
-            debug_file.write(f"Experience queue length in _create_batches after processing: {len(self.experience_queue)}\n")
-            debug_file.flush()
+            debug_log(f"Experience queue length in _create_batches after processing: {len(self.experience_queue)}")
             self.experience_queue = []
         
             await self.dispatch_batches()
-            debug_file.write("Last batch dispatched\n")
-            debug_file.flush()
+            debug_log("Last batch dispatched")
             await self.reset_batches()
             await self.dispatch_sentinel()
-            debug_file.write("Sentinel dispatched\n")
-            debug_file.flush()
+            debug_log("Sentinel dispatched")
 
     async def get_batch(self, global_rank: int):
         return await self.training_processes_queues[global_rank].get()

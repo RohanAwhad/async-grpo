@@ -74,7 +74,7 @@ def make_grpo_forward(model, loss_chunksize: int = None):
             logits = model.lm_head(hidden_states[:, i:end_idx, :]).float()
             loss, logits = model.loss_function(logits=logits, labels=shifted_labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
             total_loss.append(loss)
-            all_logits.append(logits.detach().to('bf16'))
+            all_logits.append(logits.detach().bfloat16())
 
         return CausalLMOutputWithPast(
             loss=torch.cat(total_loss, dim=0),

@@ -14,7 +14,7 @@ from sample_processing_utils import get_output_logits_indices, get_input_for_log
 import logging
 # Set logging level to debug
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
