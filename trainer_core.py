@@ -227,7 +227,7 @@ async def train(args,
                                                                 device,
                                                                 batcher_actor_name=args.experience_batcher_name,
                                                                 constant_length_samples=args.constant_length_samples):
-                loss, loss_metrics, pg_loss, kl_div = compute_grpo_loss(
+                loss, loss_metrics, pg_loss, kl_div, entropy = compute_grpo_loss(
                     policy_model,
                     minibatch,
                     args.kl_coeff,
@@ -252,6 +252,7 @@ async def train(args,
                     loss = loss_metrics,
                     pg_loss = pg_loss,
                     kl_div = kl_div,
+                    entropy = entropy,
                 )
 
             # End async for
@@ -286,7 +287,8 @@ async def train(args,
                     "grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
                     "time_per_batch": batch_time,
                     "samples_per_second": batch_num_samples / batch_time,
-                    "peak_memory_usage_GB": float(torch.cuda.max_memory_allocated() / 1e9)
+                    "peak_memory_usage_GB": float(torch.cuda.max_memory_allocated() / 1e9),
+                    "entropy": bm['entropy']/bm['output_tokens'],
                 }
                 metric_logger.log_sync(metrics_to_log)
 

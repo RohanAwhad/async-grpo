@@ -9,3 +9,5 @@ tenacity
 wrapt_timeout_decorator
 sympy
 pylatexenc
+typer
+aiofiles
