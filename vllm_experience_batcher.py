@@ -7,7 +7,7 @@ import ray
 import re
 import random
 
-DEBUG = True
+DEBUG = False
 def debug_log(message: str, file_name: str = None):
     if DEBUG:
         print(message)
