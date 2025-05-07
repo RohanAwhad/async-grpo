@@ -2,6 +2,7 @@ from copy import deepcopy
 import re
 import numpy as np
 import json
+import os
 
 def parse_experiment_logs(log_text):
     """
@@ -132,15 +133,17 @@ def plot_experiments_variables(experiments, experiment_names, variables, x_key="
     
     return fig
 
-def download_remote_log(remote_file, remote_user="lab", remote_host="rh-h100-02"):
+def download_remote_log(remote_file, remote):
     import subprocess
     import tempfile
     import os
 
+    # Copy the JSONL metrics file from a remote alias via scp
     tmp_folder = tempfile.gettempdir()
     base_name = os.path.basename(remote_file)
     local_file = os.path.join(tmp_folder, base_name)
-    scp_cmd = ["scp", "-r", f"{remote_user}@{remote_host}:{remote_file}", local_file]
+    scp_target = f"{remote}:{remote_file}"
+    scp_cmd = ["scp", "-r", scp_target, local_file]
     print(f"Copying JSONL metrics to local: {' '.join(scp_cmd)}")
     result = subprocess.run(scp_cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -149,93 +152,48 @@ def download_remote_log(remote_file, remote_user="lab", remote_host="rh-h100-02"
         print("Successfully copied metrics to", local_file)
     return local_file
 
-def get_steps_from_remote_log(remote_file, remote_user="lab", remote_host="rh-h100-02"):
-    # Download only the extracted metrics log from remote
-    local_file = download_remote_log(remote_file, remote_user, remote_host)
+def get_steps_from_remote_log(remote_file, remote=None):
+    """
+    Retrieve steps from a JSONL metrics log. If 'remote' is provided,
+    the file is fetched via scp from that alias; otherwise local file is used.
+    """
+    if remote:
+        local_file = download_remote_log(remote_file, remote)
+    else:
+        local_file = remote_file
     with open(local_file, "r") as f:
         log_text = f.read()
 
     steps = parse_experiment_logs(log_text)
     return steps
 
-##
-# remote_file = "/new_data/experiments_rh/qwen_base_1.5_deepscaler_128bs_64spq/train.log"
-# remote_file = "/new_data/experiments_rh/qwen_1.5b_r1_distill_deepscaler_test/train.log"
-# remote_file = "/new_data/experiments_rh/phi_mini_2499716_deepscaler_128bs_8spq/train_0.log.bk"
-# remote_file = "/new_data/experiments_rh/deepscaler_r1_qwen1.5b_v3/train_1.log.bk"
-# remote_file = "/new_data/experiments_rh/count_characters_exp/train_1.log.bk"
-# remote_file = "/new_data/experiments_rh/count_characters_exp_2/train_1.log.bk"
-# remote_file = "/new_data/experiments_rh/count_characters_exp_2/train.log.bk"
-# remote_file = "/new_data/experiments_rh/deepscaler_r1_qwen1.5b_v4/train_1.log.bk"
-# remote_file = "/new_data/experiments_rh/deepscaler_r1_qwen1.5b_fixed_fsdp_bug_v2_cont/train_1.log.bk"
-# remote_file = "/new_data/experiments_rh/deepscaler_r1_qwen1.5b_fixed_fsdp_bug_v2_cont3/train_1.log.bk"
-# remote_file = "/new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.5e-6/train_1.log.bk"
-# remote_file = "/new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.5e-6_v2/train_1.log.bk"
-# remote_file = "/new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.2e-6_24kgen/train_1.log.bk"
-# remote_file = "/new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.2e-6_24kgen/train_1.log.bk"
-remote_file = "/new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.2e-6_monitoring_v2/training_metrics.jsonl.bk"
-# remote_file2 = "/new_data/experiments_rh/deepscaler_no_inserts_qwen1.5b_base_5e-6/train.log"
-# remote_file2 = "/new_data/experiments_rh/qwen_base_1.5_deepscaler_128bs_16spq/train.log"
+if __name__ == "__main__":
+    # Demo / ad-hoc usage (customize as needed)
+    remote_file = "path/to/your/log.jsonl"
+    exp_names = ["my_experiment"]
 
-exp_names = [
-            # "128bs_64spq", 
-            "deepscaler_r1_distilled",
-            #  "32bs_64spq",
-             ]
+    steps = get_steps_from_remote_log(remote_file)
+    # Demo plotting; customize variables and settings as needed
+    svg_output_path = "experiment_plots.svg"
+    fig = plot_experiments_variables(
+        [steps],
+        exp_names,
+        x_key="total_samples_accumulated",
+        variables=[
+            "avg_max_reward_in_group",
+            "avg_output_tokens",
+            "entropy",
+            "perc_truncated_samples",
+            "perc_with_0_advantage",
+        ],
+        smooth=True,
+        smooth_window=40,
+        save_path=svg_output_path,
+    )
+    plt.figure(fig.number)
+    plt.show()
 
-steps = get_steps_from_remote_log(remote_file)
-# steps_ = steps[:]
-# steps = steps[:-50]a
-# steps = [dict(s, **{'samples trained on': str(float(s['samples trained on']) / 4)}) for s in steps]
-# steps2 = get_steps_from_remote_log(remote_file2)
-# steps2 = [dict(s, **{'samples trained on': str(float(s['samples trained on']) / 4)}) for s in steps2]
-
-# Define the SVG output path
-svg_output_path = "experiment_plots.svg"
-
-# Create the figure and save it as SVG
-fig = plot_experiments_variables(
-    [steps],
-    exp_names,
-    x_key="total_samples_accumulated",
-    variables=[
-        # "avg_reward",
-        "avg_max_reward_in_group",
-        "avg_output_tokens",
-        # "avg_kl_div",
-        "entropy",
-        "perc_truncated_samples",
-        "perc_with_0_advantage",
-    ],
-    smooth=True,
-    smooth_window=40,
-    save_path=svg_output_path,
-)
-
-# Display the figure
-plt.figure(fig.number)
-plt.show()
-
-# remote_user = "lab"
-# remote_host = "rh-h100-02"
-##
-steps
-sum_of_time_taken = sum([convert_to_float(s.get('time_per_batch')) for s in steps])
-sum_of_time_taken/len(steps)
-
-
-##
-
-with open("/Users/aldo/Library/CloudStorage/GoogleDrive-aldito1@gmail.com/Other computers/My Mac/Projects/grpo_feb_24th/extracted_metrics_3.log", "r") as f:
-    log_text = f.read()
-
-with open("/Users/aldo/Downloads/extracted_metrics_2.log", "r") as f:
-    log_text2 = f.read()
-steps = parse_experiment_logs(log_text)[:-1]
-steps2 = parse_experiment_logs(log_text2)
-
-steps[0].keys()
-
-
-# Plot the Average Reward Accumulated in Batch against samples trained on.
+    # Example summary calculation
+    sum_of_time_taken = sum(convert_to_float(s.get("time_per_batch")) for s in steps)
+    print(sum_of_time_taken / len(steps))
 

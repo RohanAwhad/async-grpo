@@ -156,6 +156,39 @@ torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py \\
     2>&1 | tee train_deepscaler_repro.log
 ```
 
+## Plotting Training Metrics
+
+After you run training (e.g. via `trainer_core.py`), your output directory will contain:
+- **training_metrics.jsonl**: a JSON Lines file with per-batch metrics. Each line is a JSON object with keys such as `step`, `iteration`, `total_samples_accumulated`, `avg_reward`, `entropy`, etc.
+- **training_params.json**: a JSON file listing all the command-line parameters used for this run.
+
+To visualize these metrics, use the provided CLI tool `plot.py`:
+```bash
+python plot.py plot <PATH/TO/training_metrics.jsonl> \
+  --remote YOUR_SSH_ALIAS \
+  -n YOUR_EXPERIMENT_NAME \
+  -v avg_reward \
+  -v avg_max_reward_in_group \
+  -v avg_output_tokens \
+  -v entropy \
+  -v perc_truncated_samples \
+  -v perc_with_0_advantage \
+  -x total_samples_accumulated \
+  -s --smooth-window 40 \
+  -o experiment_plots.svg
+```
+
+If your `training_metrics.jsonl` file is already local, omit the `--remote` flag:
+```bash
+python plot.py plot path/to/training_metrics.jsonl \
+  -n my_experiment \
+  -v avg_reward -v entropy \
+  -x total_samples_accumulated \
+  -o experiment_plots.svg
+```
+
+This command writes an SVG (`experiment_plots.svg`) plotting the specified variables against your training progress.
+
 ### Troubleshooting
 
 - when a ray worker fails, the driver (the process that spawns such worker) shows unrelated errors. It's usually a module not found error in the child worker.
