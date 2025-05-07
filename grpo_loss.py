@@ -75,11 +75,12 @@ def make_grpo_forward(model, loss_chunksize: int = None):
             loss, logits = model.loss_function(logits=logits, labels=shifted_labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
             total_loss.append(loss)
             entropy_list.append(entropy_from_logits(logits.detach().bfloat16()))
-
-        debug_print(f"\033[1;38;2;255;165;0m _forward line 79: \033[0m total_loss: {total_loss}")
+        total_loss = torch.cat(total_loss, dim=0)
+        debug_print(f"\033[1;38;2;255;165;0m _forward line 79: \033[0m max total_loss: {max(torch.abs(total_loss.detach()))}")
+        debug_print(f"\033[1;38;2;255;165;0m _forward line 79: \033[0m mean total_loss: {total_loss.detach().mean()}")
 
         return CausalLMOutputWithPast(
-            loss=torch.cat(total_loss, dim=0),
+            loss=total_loss,
             logits=torch.cat(entropy_list, dim=0), #using the logits field to store the entropy for metrics.
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
