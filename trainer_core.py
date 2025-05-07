@@ -148,7 +148,7 @@ async def remote_queue_batch_generator(global_rank: int,
             break
         yield post_process_batch(batch, device, constant_length_samples=constant_length_samples)
 
-def scale_model_gradients(model, total_samples_in_batch, num_samples_per_question):
+def scale_model_gradients(model, scale_factor):
     """
     Scale gradients for every parameter in the model by world_size/total_samples_in_batch.
     It's necessary to scale by world_size because fsdp takes the mean of the gradients across the world_size.
@@ -158,14 +158,14 @@ def scale_model_gradients(model, total_samples_in_batch, num_samples_per_questio
         total_samples_in_batch: The number of samples in the batch.
     """
     # the more samples per question, 
-    scale_factor = 1.0 / total_samples_in_batch
+    # scale_factor = 1.0 / total_samples_in_batch
     for param in model.parameters():
         if param.grad is not None:
             param.grad.mul_(scale_factor)
 
-def take_gradient_step(model, optimizer, lr_scheduler, accelerator, total_samples_accumulated, num_samples_per_question):
+def take_gradient_step(model, optimizer, lr_scheduler, accelerator, scale_factor):
     """Scales gradients, applies clipping, and takes an optimization step."""
-    scale_model_gradients(model, total_samples_accumulated, num_samples_per_question)
+    scale_model_gradients(model, scale_factor)
     grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
     print(f"\033[1;38;2;255;165;0mGlobal Grad Norm:\033[0m {grad_norm} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}")
     optimizer.step()
@@ -235,6 +235,7 @@ async def train(args,
                 # Multiply the loss by the number of GPUs to account for FSDP's mean reduction.
                 # Gradient scaling divides by the total number of samples in the batch across all GPUs.
                 loss *= int(os.environ["WORLD_SIZE"])
+                loss /= int(4000) # scale the loss since we are using a sum instead of a mean and need to scale down the gradients.
                 accelerator.backward(loss)
                 torch.cuda.empty_cache()
 
@@ -266,7 +267,8 @@ async def train(args,
             bm = batch_totals.totals
             batch_num_samples = bm["samples"]
             total_samples_accumulated += batch_num_samples
-            grad_norm = take_gradient_step(policy_model, optimizer, lr_scheduler, accelerator, batch_num_samples, args.samples_per_question)
+            # we multiply by 4000 and divide by the number of output tokens, which makes the loss a per-token loss.
+            grad_norm = take_gradient_step(policy_model, optimizer, lr_scheduler, accelerator, int(4000)/bm['output_tokens'])
 
             if accelerator.is_main_process:
                 batch_time = time.time() - start_time

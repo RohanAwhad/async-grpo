@@ -176,12 +176,12 @@ def compute_kl_divergence(
     kl_div = ratio - (reference_logprobs - policy_logprobs) - 1
     return kl_div
 
-def get_mean_per_sample_loss(loss, output_lens_broadcasted, num_samples):
-    """
-    loss is a tensor of shape [1, N] where N is the total number of tokens across all samples.
-    output_lens_broadcasted has the length
-    """
-    return (loss/output_lens_broadcasted).sum()/num_samples
+# def get_mean_per_sample_loss(loss, output_lens_broadcasted, num_samples):
+#     """
+#     loss is a tensor of shape [1, N] where N is the total number of tokens across all samples.
+#     output_lens_broadcasted has the length
+#     """
+#     return (loss/output_lens_broadcasted).sum()/num_samples
 
 @torch.compile
 def entropy_from_logits(logits: torch.Tensor):
@@ -277,13 +277,13 @@ def compute_grpo_loss(
     # Combined loss
     loss = pg_loss + kl_coeff * kl_div
     
-    loss_metrics = (loss.detach()/output_lens_broadcasted).sum().item()
-    pg_loss_metrics = (pg_loss.detach()/output_lens_broadcasted).sum().item()
-    kl_div_metrics = (kl_div.detach()/output_lens_broadcasted).sum().item()
+    loss_metrics = (loss.detach()).sum().item()
+    pg_loss_metrics = (pg_loss.detach()).sum().item()
+    kl_div_metrics = (kl_div.detach()).sum().item()
     start_time = time.time()
     entropy_metrics = model_out.logits[output_indices].sum()
     # print(f"Time taken to compute entropy: {time.time() - start_time} seconds", flush=True)
-    loss = (loss/output_lens_broadcasted).sum()
+    loss = loss.sum()
     # torch.distributed.breakpoint()
 
     return loss, loss_metrics, pg_loss_metrics, kl_div_metrics, entropy_metrics
