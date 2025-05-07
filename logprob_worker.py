@@ -137,15 +137,18 @@ class LogprobWorker:
         """
         output_indices, _ = get_output_logits_indices(samples, self.device)
         input_ids, position_ids, labels = get_input_for_logprobs(samples, output_indices, self.device)
-
-        self.model.eval()
-        with torch.no_grad():
-            log_probs = self.model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                labels=labels,
-            ).loss
-
+        try:
+            self.model.eval()
+            with torch.no_grad():
+                log_probs = self.model(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    labels=labels,
+                ).loss
+        except Exception as e:
+            logging.error(f"\033[1;38;2;255;165;0m _compute_logprobs line 149: \033[0m error: {e}")
+            raise e
+        
         sample_lens = [len(s['sample_ids']) for s in samples]
         log_probs = torch.split(log_probs, sample_lens)
         for s, log_prob in zip(samples, log_probs):
