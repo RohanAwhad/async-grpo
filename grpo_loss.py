@@ -16,7 +16,7 @@ def debug_print(message):
     print(message)
 
 
-def make_grpo_forward(model, loss_chunksize: int = None):
+def make_grpo_forward(model, loss_chunksize: int = None, temperature: float = 1.0):
     def _forward(
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -71,7 +71,7 @@ def make_grpo_forward(model, loss_chunksize: int = None):
 
         for i in range(0, T, loss_chunksize):
             end_idx = min(i + loss_chunksize, T)
-            logits = model.lm_head(hidden_states[:, i:end_idx, :]).float()
+            logits = model.lm_head(hidden_states[:, i:end_idx, :]).float()/temperature
             loss, logits = model.loss_function(logits=logits, labels=shifted_labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
             total_loss.append(loss)
             entropy_list.append(entropy_from_logits(logits.detach().bfloat16()))
