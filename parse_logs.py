@@ -138,10 +138,10 @@ def download_remote_log(remote_file, remote):
     import tempfile
     import os
 
-    # Copy the JSONL metrics file from a remote alias via scp
-    tmp_folder = tempfile.gettempdir()
-    base_name = os.path.basename(remote_file)
-    local_file = os.path.join(tmp_folder, base_name)
+    # Create a unique temporary file for this download
+    name, ext = os.path.splitext(os.path.basename(remote_file))
+    fd, local_file = tempfile.mkstemp(prefix=f"{name}_", suffix=ext)
+    os.close(fd)
     scp_target = f"{remote}:{remote_file}"
     scp_cmd = ["scp", "-r", scp_target, local_file]
     print(f"Copying JSONL metrics to local: {' '.join(scp_cmd)}")
