@@ -32,12 +32,13 @@ def init_logprob_dist_env():
 
 @ray.remote(num_gpus=1, num_cpus=4)
 class LogprobWorker:
-    def __init__(self, model_path: str, worker_id: str, max_tokens_per_gpu: int = 23000):
+    def __init__(self, model_path: str, worker_id: str, max_tokens_per_gpu: int = 23000, temperature: float = 1.0):
         self.args = argparse.Namespace(
             model_name_or_path=model_path,
             worker_id=worker_id,
             fsdp_sharding_strategy="FULL_SHARD",
             loss_chunksize=None,
+            temperature=temperature,
         )
         self.worker_id = worker_id
         self.max_tokens_per_gpu = max_tokens_per_gpu
