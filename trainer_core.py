@@ -22,6 +22,7 @@ from utils import init_distributed_environment, log_rank_0, setup_logger, ArgsNa
 from sample_processing_utils import post_process_batch
 from batch_metrics import BatchMetrics
 from async_structured_logger import AsyncStructuredLogger
+from vllm_experience_batcher import MessageType
 
 
 class JsonlDataset(Dataset):
@@ -143,10 +144,11 @@ async def remote_queue_batch_generator(global_rank: int,
                                        constant_length_samples: int | None = None):
     batcher_actor = ray.get_actor(batcher_actor_name)
     while True:
-        batch = await batcher_actor.get_batch.remote(global_rank)
-        if batch is None:
+        msg = await batcher_actor.get_batch.remote(global_rank)
+        if msg.type == MessageType.GRADIENT_STEP:
             break
-        yield post_process_batch(batch, device, constant_length_samples=constant_length_samples)
+        if msg.type == MessageType.MINIBATCH:
+            yield post_process_batch(msg.data, device, constant_length_samples=constant_length_samples)
 
 def scale_model_gradients(model, scale_factor):
     """

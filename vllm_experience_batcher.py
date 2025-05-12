@@ -6,6 +6,9 @@ import ray
 
 import re
 import random
+from enum import Enum
+from dataclasses import dataclass
+from typing import Any, Optional
 
 DEBUG = False
 def debug_log(message: str, file_name: str = None):
@@ -45,6 +48,15 @@ async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_ha
     samples_with_ref_logprobs = await asyncio.gather(*tasks)
     debug_log(f"Samples with reference logprobs for {sample['input']}")
     return samples_with_ref_logprobs
+
+class MessageType(Enum):
+    MINIBATCH = "minibatch"
+    GRADIENT_STEP = "gradient_step"
+
+@dataclass
+class Message:
+    type: MessageType
+    data: Optional[Any] = None
 
 @ray.remote
 class ExperienceBatcher:
@@ -89,7 +101,7 @@ class ExperienceBatcher:
     async def dispatch_batches(self):
         if all(len(batch) > 0 for batch in self.training_batches.values()):
             for batch_id, batch in self.training_batches.items():
-                await self.training_processes_queues[batch_id].put(batch)
+                await self.training_processes_queues[batch_id].put(Message(MessageType.MINIBATCH, batch))
             await self.reset_batches()
             return True
         else:
@@ -98,7 +110,7 @@ class ExperienceBatcher:
 
     async def dispatch_sentinel(self):
         for queue in self.training_processes_queues.values():
-            await queue.put(None)
+            await queue.put(Message(MessageType.GRADIENT_STEP))
 
     async def _create_batches(self):
         """Continuously consumes tasks from the experience_queue and processes them."""
