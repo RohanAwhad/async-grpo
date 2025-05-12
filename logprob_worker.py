@@ -32,12 +32,13 @@ def init_logprob_dist_env():
 
 @ray.remote(num_gpus=1, num_cpus=4)
 class LogprobWorker:
-    def __init__(self, model_path: str, worker_id: str, max_tokens_per_gpu: int = 23000):
+    def __init__(self, model_path: str, worker_id: str, max_tokens_per_gpu: int = 23000, temperature: float = 1.0):
         self.args = argparse.Namespace(
             model_name_or_path=model_path,
             worker_id=worker_id,
             fsdp_sharding_strategy="FULL_SHARD",
             loss_chunksize=None,
+            temperature=temperature,
         )
         self.worker_id = worker_id
         self.max_tokens_per_gpu = max_tokens_per_gpu
@@ -137,15 +138,18 @@ class LogprobWorker:
         """
         output_indices, _ = get_output_logits_indices(samples, self.device)
         input_ids, position_ids, labels = get_input_for_logprobs(samples, output_indices, self.device)
-
-        self.model.eval()
-        with torch.no_grad():
-            log_probs = self.model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                labels=labels,
-            ).loss
-
+        try:
+            self.model.eval()
+            with torch.no_grad():
+                log_probs = self.model(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    labels=labels,
+                ).loss
+        except Exception as e:
+            logging.error(f"\033[1;38;2;255;165;0m _compute_logprobs line 149: \033[0m error: {e}")
+            raise e
+        
         sample_lens = [len(s['sample_ids']) for s in samples]
         log_probs = torch.split(log_probs, sample_lens)
         for s, log_prob in zip(samples, log_probs):

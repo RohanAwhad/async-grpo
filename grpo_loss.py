@@ -16,7 +16,7 @@ def debug_print(message):
     print(message)
 
 
-def make_grpo_forward(model, loss_chunksize: int = None):
+def make_grpo_forward(model, loss_chunksize: int = None, temperature: float = 1.0):
     def _forward(
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -71,13 +71,16 @@ def make_grpo_forward(model, loss_chunksize: int = None):
 
         for i in range(0, T, loss_chunksize):
             end_idx = min(i + loss_chunksize, T)
-            logits = model.lm_head(hidden_states[:, i:end_idx, :]).float()
+            logits = model.lm_head(hidden_states[:, i:end_idx, :]).float()/temperature
             loss, logits = model.loss_function(logits=logits, labels=shifted_labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
             total_loss.append(loss)
             entropy_list.append(entropy_from_logits(logits.detach().bfloat16()))
+        total_loss = torch.cat(total_loss, dim=0)
+        debug_print(f"\033[1;38;2;255;165;0m _forward line 79: \033[0m max total_loss: {max(torch.abs(total_loss.detach()))}")
+        debug_print(f"\033[1;38;2;255;165;0m _forward line 79: \033[0m mean total_loss: {total_loss.detach().mean()}")
 
         return CausalLMOutputWithPast(
-            loss=torch.cat(total_loss, dim=0),
+            loss=total_loss,
             logits=torch.cat(entropy_list, dim=0), #using the logits field to store the entropy for metrics.
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -176,12 +179,12 @@ def compute_kl_divergence(
     kl_div = ratio - (reference_logprobs - policy_logprobs) - 1
     return kl_div
 
-def get_mean_per_sample_loss(loss, output_lens_broadcasted, num_samples):
-    """
-    loss is a tensor of shape [1, N] where N is the total number of tokens across all samples.
-    output_lens_broadcasted has the length
-    """
-    return (loss/output_lens_broadcasted).sum()/num_samples
+# def get_mean_per_sample_loss(loss, output_lens_broadcasted, num_samples):
+#     """
+#     loss is a tensor of shape [1, N] where N is the total number of tokens across all samples.
+#     output_lens_broadcasted has the length
+#     """
+#     return (loss/output_lens_broadcasted).sum()/num_samples
 
 @torch.compile
 def entropy_from_logits(logits: torch.Tensor):
@@ -277,13 +280,13 @@ def compute_grpo_loss(
     # Combined loss
     loss = pg_loss + kl_coeff * kl_div
     
-    loss_metrics = (loss.detach()/output_lens_broadcasted).sum().item()
-    pg_loss_metrics = (pg_loss.detach()/output_lens_broadcasted).sum().item()
-    kl_div_metrics = (kl_div.detach()/output_lens_broadcasted).sum().item()
+    loss_metrics = (loss.detach()).sum().item()
+    pg_loss_metrics = (pg_loss.detach()).sum().item()
+    kl_div_metrics = (kl_div.detach()).sum().item()
     start_time = time.time()
     entropy_metrics = model_out.logits[output_indices].sum()
     # print(f"Time taken to compute entropy: {time.time() - start_time} seconds", flush=True)
-    loss = (loss/output_lens_broadcasted).sum()
+    loss = loss.sum()
     # torch.distributed.breakpoint()
 
     return loss, loss_metrics, pg_loss_metrics, kl_div_metrics, entropy_metrics

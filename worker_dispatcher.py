@@ -33,7 +33,7 @@ def get_runtime_env(mode: str):
 def create_worker(mode: str, model_path: str, tensor_parallel_size: int=1, max_num_seqs: int=1,
                     global_num_verifiers: int = 100, max_tokens_per_gpu: int = 23000,
                     write_failed_generation_samples: bool = False, overhead_seqs: int = 8,
-                    enable_prefix_caching: bool = True):
+                    enable_prefix_caching: bool = True, temperature: float = 1.0):
     """
     Instantiate the appropriate worker on the remote process after the runtime environment
     is set up. This defers the import of worker-specific modules to the worker process.
@@ -67,6 +67,7 @@ def create_worker(mode: str, model_path: str, tensor_parallel_size: int=1, max_n
             model_path=model_path,
             worker_id=service_id,
             max_tokens_per_gpu=max_tokens_per_gpu,
+            temperature=temperature,
         )
     else:
         raise ValueError(f"Invalid mode: {mode}")
@@ -96,6 +97,8 @@ if __name__ == "__main__":
                         help="Number of sequences to send to each worker over the limit")
     parser.add_argument("--enable_prefix_caching", type=lambda x: x.lower()=='true', default=True,
                         help="Toggle prefix caching for generation worker (True/False)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Temperature for logprob worker")
     args = parser.parse_args()
 
     # Initialize Ray.
@@ -122,7 +125,8 @@ if __name__ == "__main__":
         global_num_verifiers=args.global_num_verifiers,
         write_failed_generation_samples=args.write_failed_generation_samples,
         overhead_seqs=args.overhead_seqs,
-        enable_prefix_caching=args.enable_prefix_caching
+        enable_prefix_caching=args.enable_prefix_caching,
+        temperature=args.temperature,
     ))
 
     print(f"Worker {worker} created.")

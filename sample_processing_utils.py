@@ -102,7 +102,16 @@ def get_input_for_logprobs(batched_questions, output_indices, device):
         [torch.tensor(s['sample_position_ids'], dtype=torch.long) for s in batched_questions]
     ).unsqueeze(0).to(device)
     labels = torch.ones_like(batch_ids) * -100
-    labels[:, output_indices+1] = batch_ids[:, output_indices+1]
+
+    start_idx = 0
+    for s in batched_questions:
+        L_out = s['output_len']
+        # if this sample wasn’t truncated, copy its output token ids into labels
+        if not s['truncated_sample']:
+            idxs = output_indices[start_idx:start_idx + L_out] + 1      # +1 is your original offset
+            labels[:, idxs] = batch_ids[:, idxs]
+        start_idx += L_out
+    # labels[:, output_indices+1] = batch_ids[:, output_indices+1]
     return batch_ids, batch_position_ids, labels
 
 def post_process_batch(batched_questions, device, constant_length_samples=None):
@@ -176,6 +185,7 @@ def post_process_batch(batched_questions, device, constant_length_samples=None):
         "advantages": advantages.contiguous(),
         "reference_output_logprobs": reference_output_logprobs.contiguous(),
         "output_lens_broadcasted": output_lens_broadcasted.contiguous(),
+        "num_output_tokens_non_masked": torch.tensor((labels != -100).sum(), device=device, dtype=torch.float32),
         "num_output_tokens": torch.tensor(output_lens.sum(), device=device, dtype=torch.float32),
         "num_samples": torch.tensor(len(batched_questions), device=device, dtype=torch.float32),
         "max_reward_in_group": torch.tensor(sum([s['max_reward_in_group'] for s in batched_questions]), device=device, dtype=torch.float32),

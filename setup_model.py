@@ -113,7 +113,7 @@ def setup_model(args, model=None):
     if model is None:
         model = AutoModelForCausalLM.from_pretrained(**base_model_args)
     model = align_model_and_tokenizer(model, tokenizer)
-    model = make_grpo_forward(model, args.loss_chunksize)
+    model = make_grpo_forward(model, args.loss_chunksize, args.temperature)
     model.loss_function = PerTokenLogProbsFromCE
     if getattr(args, 'use_torch_compile', True):
         torch.compile(model.model)
