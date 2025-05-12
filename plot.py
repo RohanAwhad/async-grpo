@@ -133,18 +133,21 @@ if __name__ == "__main__":
     app() 
 
 '''
-python plot_cli.py plot \
-  /new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.2e-6_monitoring_v2/training_metrics.jsonl.bk \
-  --remote-host rh-h100-02 \
-  --remote-user lab \
-  -n deepscaler_r1_distilled \
-  -v avg_max_reward_in_group \
-  -v avg_output_tokens \
-  -v entropy \
-  -v perc_truncated_samples \
-  -v perc_with_0_advantage \
-  -x total_samples_accumulated \
-  -s \
-  --smooth-window 40 \
-  -o experiment_plots.svg
+    /new_data/experiments_rh/deepscaler_r1_qwen1.5b_2e-6_filt-truncated+token-level-loss_fixed/training_metrics.jsonl \
+    /new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.2e-6_monitoring_v2/training_metrics.jsonl \
+    --variable avg_reward \
+python plot.py plot \
+    /new_data/experiments_rh/deepscaler_r1_qwen1.5b_2e-6_filt-truncated+tk-level-loss_126e-8_tempfix/training_metrics.jsonl \
+    /new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.2e-6_token-level-loss_v2/training_metrics.jsonl \
+    --remote lab@rh-h100-02 \
+    --name deepscaler_r1_qwen1.5b_1.2e-6_monitoring_v2 \
+    --name deepscaler_r1_qwen1.5b_2e-6_token-level-loss_fixed \
+    --variable grad_norm \
+    --variable avg_output_tokens \
+    --variable entropy \
+    --variable perc_truncated_samples \
+    --variable perc_with_0_advantage \
+    --x_key total_samples_accumulated \
+    --smooth \
+    --smooth-window 40
 '''
