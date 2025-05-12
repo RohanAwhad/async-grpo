@@ -138,17 +138,19 @@ def save_model(args, model, accelerator, samples_seen):
         tokenizer.save_pretrained(output_dir)
         log_rank_0(f"\033[1;38;2;0;255;255mSaved model at\033[0m {samples_seen} samples in {time.time() - start:.2f} seconds")
 
-async def remote_queue_batch_generator(global_rank: int,
+async def remote_event_generator(global_rank: int,
                                        device: torch.device,
                                        batcher_actor_name: str = "experience_batcher",
                                        constant_length_samples: int | None = None):
+    """
+    Yield raw Message objects from the batcher, stopping on BATCH_DONE.
+    """
     batcher_actor = ray.get_actor(batcher_actor_name)
     while True:
         msg = await batcher_actor.get_batch.remote(global_rank)
-        if msg.type == MessageType.GRADIENT_STEP:
+        yield msg
+        if msg.type == MessageType.BATCH_DONE:
             break
-        if msg.type == MessageType.MINIBATCH:
-            yield post_process_batch(msg.data, device, constant_length_samples=constant_length_samples)
 
 def scale_model_gradients(model, scale_factor):
     """
@@ -205,7 +207,6 @@ async def train(args,
         log_rank_0(f"Starting iteration {iteration + 1}/{args.num_iterations}")
 
         for step in range(args.num_batches_per_ref_model_update):
-            start_time = time.time()
             batch = next(dataloader)
             torch.distributed.barrier()
             await batcher_actor.generate_experience.remote(
@@ -223,93 +224,100 @@ async def train(args,
                 ray.get(batcher_actor.start_creating_batches.remote())
             torch.distributed.barrier()
 
-            # Initialize a Metrics instance for accumulating minibatch metrics
+            # Reset metrics and process events driven by the batcher
             batch_totals.reset_batch()
-            async for minibatch in remote_queue_batch_generator(args.global_rank,
-                                                                device,
-                                                                batcher_actor_name=args.experience_batcher_name,
-                                                                constant_length_samples=args.constant_length_samples):
-                loss, loss_metrics, pg_loss, kl_div, entropy = compute_grpo_loss(
-                    policy_model,
-                    minibatch,
-                    args.kl_coeff,
-                )
-                # Multiply the loss by the number of GPUs to account for FSDP's mean reduction.
-                # Gradient scaling divides by the total number of samples in the batch across all GPUs.
-                loss *= int(os.environ["WORLD_SIZE"])
-                loss /= int(4000) # scale the loss since we are using a sum instead of a mean and need to scale down the gradients.
-                accelerator.backward(loss)
-                torch.cuda.empty_cache()
-
-                
-                # Accumulate metrics in the Metrics instance
-                batch_totals.accumulate_minibatch_metrics(
-                    output_tokens = minibatch["num_output_tokens"],
-                    non_masked_output_tokens = minibatch["num_output_tokens_non_masked"],
-                    samples = minibatch["num_samples"],
-                    reward = minibatch["total_reward_rank"],
-                    modified_reward = minibatch["total_modified_reward"],
-                    modified_samples = minibatch["num_modified_samples"],
-                    delimiter_not_found = minibatch["delimiter_not_found"],
-                    non_modified_reward = minibatch["total_non_modified_reward"],
-                    max_reward_in_group = minibatch["max_reward_in_group"],
-                    loss = loss_metrics,
-                    backward_loss = loss.detach().item(),
-                    pg_loss = pg_loss,
-                    kl_div = kl_div,
-                    entropy = entropy,
-                    advantage_is_zero = minibatch["advantage_is_zero"],
-                    truncated_sample = minibatch["truncated_sample"],
-                )
-
-            # End async for
-
-            # Reduce minibatch metrics and accumulate into batch_metrics
-            batch_totals.reduce_batch_metrics(accelerator)
-
-            # Use accumulated metrics for gradient step and logging
-            bm = batch_totals.totals
-            batch_num_samples = bm["samples"]
-            total_samples_accumulated += batch_num_samples
-            # we multiply by 4000 and divide by the number of output tokens, which makes the loss a per-token loss.
-            grad_norm = take_gradient_step(policy_model, optimizer, lr_scheduler, accelerator, int(4000)/bm['non_masked_output_tokens'])
-
-            if accelerator.is_main_process:
-                batch_time = time.time() - start_time
-                metrics_to_log = {
-                    "step": step,
-                    "iteration": iteration,
-                    "total_samples_accumulated": total_samples_accumulated,
-                    "samples_in_batch": batch_num_samples,
-                    "avg_reward": bm['reward']/batch_num_samples,
-                    "avg_output_tokens": bm['output_tokens']/batch_num_samples,
-                    "avg_loss": bm['loss']/bm['non_masked_output_tokens'],
-                    "lr": lr_scheduler.get_last_lr()[0],
-                    "backward_loss": bm['backward_loss']*int(4000)/bm['non_masked_output_tokens'],
-                    "avg_pg_loss": bm['pg_loss']/bm['non_masked_output_tokens'],
-                    "avg_kl_div": bm['kl_div']/bm['non_masked_output_tokens'],
-                    "avg_modified_reward": bm['modified_reward']/(bm['modified_samples']+1e-6),
-                    "num_modified_samples": bm['modified_samples'],
-                    "avg_delimiter_not_found": bm['delimiter_not_found']/(bm['modified_samples']+1e-6),
-                    "avg_non_modified_reward": bm['non_modified_reward']/(batch_num_samples - bm['modified_samples']+1e-9),
-                    "avg_max_reward_in_group": bm['max_reward_in_group']/batch_num_samples,
-                    "perc_with_0_advantage": bm['advantage_is_zero']/batch_num_samples,
-                    "perc_truncated_samples": bm['truncated_sample']/batch_num_samples,
-                    "grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
-                    "time_per_batch": batch_time,
-                    "samples_per_second": batch_num_samples / batch_time,
-                    "peak_memory_usage_GB": float(torch.cuda.max_memory_allocated() / 1e9),
-                    "entropy": bm['entropy']/bm['output_tokens'],
-                }
-                metric_logger.log_sync(metrics_to_log)
-
-            if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
-                save_model(args, policy_model, accelerator, total_samples_accumulated)
-                last_saved_samples = total_samples_accumulated
-            
-            #update both logprob and generation workers at the last step of the ref model update loop
-            registry_actor_names = ["generation_vllm_registry", "logprob_vllm_registry"] if step == args.num_batches_per_ref_model_update - 1 else ["generation_vllm_registry"]
-            update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=registry_actor_names)
+            event_start_time = time.time()
+            async for msg in remote_event_generator(
+                args.global_rank,
+                device,
+                batcher_actor_name=args.experience_batcher_name,
+                constant_length_samples=args.constant_length_samples,
+            ):
+                if msg.type is MessageType.MINIBATCH:
+                    mb = post_process_batch(msg.data, device, constant_length_samples=args.constant_length_samples)
+                    loss, loss_metrics, pg_loss, kl_div, entropy = compute_grpo_loss(
+                        policy_model,
+                        mb,
+                        args.kl_coeff,
+                    )
+                    loss *= world_size
+                    loss /= int(4000)
+                    accelerator.backward(loss)
+                    torch.cuda.empty_cache()
+                    batch_totals.accumulate_minibatch_metrics(
+                        output_tokens=mb["num_output_tokens"],
+                        non_masked_output_tokens=mb["num_output_tokens_non_masked"],
+                        samples=mb["num_samples"],
+                        reward=mb["total_reward_rank"],
+                        modified_reward=mb["total_modified_reward"],
+                        modified_samples=mb["num_modified_samples"],
+                        delimiter_not_found=mb["delimiter_not_found"],
+                        non_modified_reward=mb["total_non_modified_reward"],
+                        max_reward_in_group=mb["max_reward_in_group"],
+                        loss=loss_metrics,
+                        backward_loss=loss.detach().item(),
+                        pg_loss=pg_loss,
+                        kl_div=kl_div,
+                        entropy=entropy,
+                        advantage_is_zero=mb["advantage_is_zero"],
+                        truncated_sample=mb["truncated_sample"],
+                    )
+                elif msg.type in (MessageType.GRADIENT_STEP, MessageType.BATCH_DONE):
+                    # reduce metrics, take gradient step
+                    batch_totals.reduce_batch_metrics(accelerator)
+                    bm = batch_totals.totals
+                    total_samples_accumulated += bm["samples"]
+                    grad_norm = take_gradient_step(
+                        policy_model, optimizer, lr_scheduler, accelerator,
+                        int(4000)/bm["non_masked_output_tokens"]
+                    )
+                    if accelerator.is_main_process:
+                        # compute timing since event start
+                        batch_time = time.time() - event_start_time
+                        event_start_time = time.time()
+                        # original logging fields, now per step
+                        metrics_to_log = {
+                            "step": step,
+                            "iteration": iteration,
+                            "total_samples_accumulated": total_samples_accumulated,
+                            "samples_in_batch": bm["samples"],
+                            "avg_reward": bm["reward"] / bm["samples"],
+                            "avg_output_tokens": bm["output_tokens"] / bm["samples"],
+                            "avg_loss": bm["loss"] / bm["non_masked_output_tokens"],
+                            "lr": lr_scheduler.get_last_lr()[0],
+                            "backward_loss": bm["backward_loss"] * int(4000) / bm["non_masked_output_tokens"],
+                            "avg_pg_loss": bm["pg_loss"] / bm["non_masked_output_tokens"],
+                            "avg_kl_div": bm["kl_div"] / bm["non_masked_output_tokens"],
+                            "avg_modified_reward": bm["modified_reward"] / (bm["modified_samples"] + 1e-6),
+                            "num_modified_samples": bm["modified_samples"],
+                            "avg_delimiter_not_found": bm["delimiter_not_found"] / (bm["modified_samples"] + 1e-6),
+                            "avg_non_modified_reward": bm["non_modified_reward"] / (bm["samples"] - bm["modified_samples"] + 1e-9),
+                            "avg_max_reward_in_group": bm["max_reward_in_group"] / bm["samples"],
+                            "perc_with_0_advantage": bm["advantage_is_zero"] / bm["samples"],
+                            "perc_truncated_samples": bm["truncated_sample"] / bm["samples"],
+                            "grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
+                            "time_per_batch": batch_time,
+                            "samples_per_second": bm["samples"] / batch_time,
+                            "peak_memory_usage_GB": float(torch.cuda.max_memory_allocated() / 1e9),
+                            "entropy": bm["entropy"] / bm["output_tokens"],
+                            "batch_done": msg.type is MessageType.BATCH_DONE,
+                        }
+                        metric_logger.log_sync(metrics_to_log)
+                        if msg.type is MessageType.BATCH_DONE:
+                            # checkpoint if threshold reached
+                            if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
+                                save_model(args, policy_model, accelerator, total_samples_accumulated)
+                                last_saved_samples = total_samples_accumulated
+                            # broadcast updated weights
+                            registry_actor_names = (
+                                ["generation_vllm_registry", "logprob_vllm_registry"]
+                                if step == args.num_batches_per_ref_model_update - 1
+                                else ["generation_vllm_registry"]
+                            )
+                            update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=registry_actor_names)
+                    # reset metrics for next event
+                    batch_totals.reset_batch()
+                    # loop ends naturally after BATCH_DONE from the generator
         
             
 
@@ -359,6 +367,7 @@ def main(
     kl_coeff: float = Option(0.001, help="KL coefficient for GRPO loss."),
     num_iterations: int = Option(1000000, help="Total number of training iterations."),
     num_batches_per_ref_model_update: int = Option(40, help="Number of training batches before updating the reference model weights."),
+    train_minibatch_size: int = Option(4000, help="Number of samples after which to trigger a GRADIENT_STEP message."),
     logging_level: LogLevelEnum = Option(LogLevelEnum.INFO, help="Logging level", case_sensitive=False),
     global_rank: int = Option(int(os.environ.get("RANK", 0)), help="Global rank of the process."), # Add global_rank from env
     use_torch_compile: bool = Option(True, help="Use torch.compile to speed up training."),
@@ -390,6 +399,7 @@ def main(
         kl_coeff=kl_coeff,
         num_iterations=num_iterations,
         num_batches_per_ref_model_update=num_batches_per_ref_model_update,
+        train_minibatch_size=train_minibatch_size,
         global_rank=global_rank, # Manually add global_rank
         use_torch_compile=use_torch_compile,
     )
