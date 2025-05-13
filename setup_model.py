@@ -32,6 +32,7 @@ def get_fsdp_config(args, model: PreTrainedModel):
 
     block_name = model._no_split_modules[0]
     fsdp_plugin = FullyShardedDataParallelPlugin(
+        fsdp_version=2,
         auto_wrap_policy=partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={
@@ -39,19 +40,8 @@ def get_fsdp_config(args, model: PreTrainedModel):
             },
         ),
         limit_all_gathers=True,
-        # mixed_precision_policy=MixedPrecision(
-        #     param_dtype=torch.bfloat16,
-        #     reduce_dtype=torch.bfloat16,
-        #     buffer_dtype=torch.bfloat16,
-        # ),
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        sharding_strategy=ShardingStrategy[args.fsdp_sharding_strategy],
-        # sync_module_states=True,
-        # param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False),
-        #     # if torch.distributed.get_rank()!=0 else None,
-        # cpu_ram_efficient_loading=True,
-        use_orig_params=True,
         state_dict_type="full_state_dict",
+        fsdp_reshard_after_forward=args.fsdp_reshard_after_forward,
     )
 
     return fsdp_plugin
