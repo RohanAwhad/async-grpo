@@ -224,8 +224,6 @@ async def train(args,
             ray.get(batcher_actor.start_creating_batches.remote())
         torch.distributed.barrier()
 
-        # Reset metrics and process events driven by the batcher
-        batch_totals.reset_batch()
         event_start_time = time.time()
         async for msg in remote_event_generator(
             args.global_rank,
