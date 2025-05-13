@@ -338,12 +338,20 @@ def compute_dual_clip_grpo_loss(
     )
 
     # Track clipping and loss metrics
+    # metrics = {
+    #     "loss": pg_loss.detach().item(),
+    #     "pg_loss": pg_loss.detach().item(),
+    #     "pg_clip": (loss_clipped > loss_unclipped).detach()[output_indices].sum().item(),
+    #     "pg_clip_lower": ((loss_clip1 > loss_clipped_dual) & is_negative).detach()[output_indices].sum().item(),
+    #     "kl_div": (-neg_log_ratio.detach())[output_indices].sum().item(),
+    #     "entropy": model_out.logits[output_indices].sum().item(),
+    # }
     metrics = {
         "loss": pg_loss.detach().item(),
         "pg_loss": pg_loss.detach().item(),
-        "pg_clip": (loss_clipped > loss_unclipped).detach()[output_indices].sum().item(),
-        "pg_clip_lower": ((loss_clip1 > loss_clipped_dual) & is_negative).detach()[output_indices].sum().item(),
-        "kl_div": (-neg_log_ratio.detach())[output_indices].sum().item(),
+        "pg_clip": (loss_clipped > loss_unclipped).detach().sum().item(),
+        "pg_clip_lower": ((loss_clip1 > loss_clipped_dual) & is_negative).detach().sum().item(),
+        "kl_div": (-neg_log_ratio.detach()).sum().item(),
         "entropy": model_out.logits[output_indices].sum().item(),
     }
     return pg_loss, metrics
