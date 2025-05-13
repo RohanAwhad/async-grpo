@@ -204,6 +204,23 @@ def policy_loss(
     clip_high: float,
     clip_ratio_c: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # negative_approx_kl = policy_logprobs - old_logprobs
+    # ratio = torch.exp(negative_approx_kl)
+    # # ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    # pg_losses1 = -advantages * ratio
+    # pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_low, 1 + clip_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    # clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    # # pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    # pg_losses3 = -advantages * clip_ratio_c
+    # clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    # # pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+
+    # pg_loss = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1).sum()
+    # # pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    # return pg_loss, negative_approx_kl, clip_pg_losses1, pg_losses1, 
     neg_log_ratio = policy_logprobs - old_logprobs
     ratio = torch.exp(neg_log_ratio)
 
@@ -224,7 +241,7 @@ def policy_loss(
     loss_clip2 = torch.minimum(loss_clip1, loss_clipped_dual)
 
     # Final per-token loss selection
-    pg_loss = torch.where(is_negative, loss_clip2, loss_clip1)[output_indices].sum()
+    pg_loss = torch.where(is_negative, loss_clip2, loss_clip1).sum()
     return pg_loss, neg_log_ratio, loss_clip1, loss_unclipped, loss_clipped, loss_clipped_dual, is_negative
     
 
