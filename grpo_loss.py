@@ -194,31 +194,75 @@ def entropy_from_logits(logits: torch.Tensor):
         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
     return entropy
 
+@torch.compile
+def policy_loss(
+    policy_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    output_indices: torch.Tensor,
+    clip_low: float,
+    clip_high: float,
+    clip_ratio_c: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    neg_log_ratio = policy_logprobs - old_logprobs
+    ratio = torch.exp(neg_log_ratio)
+
+    # 2) Determine clipping bounds
+    lower = 1.0 - clip_low
+    upper = 1.0 + clip_high
+
+    # 3) Compute per-token surrogate losses
+    loss_unclipped = -advantages * ratio
+    loss_clipped = -advantages * torch.clamp(ratio, lower, upper)
+    loss_clipped_dual = -advantages * clip_ratio_c
+
+    # 4) Standard PPO clipping: max(unclipped, clipped)
+    loss_clip1 = torch.maximum(loss_unclipped, loss_clipped)
+
+    # 5) Dual-clip step for negative advantages: cap at clip_ratio_c
+    is_negative = advantages < 0
+    loss_clip2 = torch.minimum(loss_clip1, loss_clipped_dual)
+
+    # Final per-token loss selection
+    pg_loss = torch.where(is_negative, loss_clip2, loss_clip1)[output_indices].sum()
+    return pg_loss, neg_log_ratio, loss_clip1, loss_unclipped, loss_clipped, loss_clipped_dual, is_negative
+    
+
 # @torch.compile
-def compute_grpo_loss(
+def compute_dual_clip_grpo_loss(
     policy_model,
     minibatch,
-    kl_coeff: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    clip_low: float,
+    clip_high: float,
+    clip_ratio_c: float,
+) -> Tuple[torch.Tensor, dict]:
     """
-    Compute GRPO loss with its components using the PPO-style probability ratio trick.
+    Compute GRPO loss using the dual-clip PPO algorithm.
 
-    # The policy gradient is computed as:
-    #
-    #     ∇θ J(πθ) = 𝔼₍τ ∼ πθ₎ [ Σₜ₌₀ᵀ ∇θ log πθ(aₜ | sₜ) · Φₜ ]
-    #
-    # Here, ∇θ denotes the gradient with respect to the policy parameters θ, and the expectation
-    # is over trajectories τ sampled from the policy πθ. In our implementation, we then take an
-    # average over the number of trajectories in the batch (at the gradient step level).
-    # We also divide by the number of tokens (actions) in each trajectory to ensure long and short
-    # trajectories contribute to the gradient equally.
+    This loss applies two clipping mechanisms:
+      - Clipping the probability ratio within [1 - clip_low, 1 + clip_high].
+      - For negative advantages, clipping the loss to -advantages * clip_ratio_c.
+
+    Args:
+        policy_model: A causal LM policy model to evaluate.
+        minibatch: A dict containing batch data keys:
+            'batch_ids', 'batch_position_ids', 'labels',
+            'reference_output_logprobs', 'advantages', and 'output_indices'.
+        clip_low: Lower epsilon for PPO clipping (bounds ratio >= 1 - clip_low).
+        clip_high: Upper epsilon for PPO clipping (bounds ratio <= 1 + clip_high).
+        clip_ratio_c: Dual clipping constant c for negative advantages.
+
+    Returns:
+        loss (Tensor): Scalar policy gradient loss to backpropagate.
+        metrics (dict): Dictionary of metric values:
+            'loss', 'pg_loss', 'pg_clip', 'pg_clip_lower', 'kl_div', 'entropy'.
     """
     # torch.autograd.set_detect_anomaly(True)
     # print("\033[1;91;40mDEBUG: remove torch.autograd.set_detect_anomaly(True)\033[0m")
     batch_ids = minibatch["batch_ids"]
     batch_position_ids = minibatch["batch_position_ids"]
     output_indices = minibatch["output_indices"]
-    reference_logprobs = minibatch["reference_output_logprobs"]
+    old_logprobs = minibatch["reference_output_logprobs"]
     advantages = minibatch["advantages"]
     output_lens_broadcasted = minibatch["output_lens_broadcasted"]
     labels = minibatch["labels"]
@@ -266,27 +310,47 @@ def compute_grpo_loss(
     # torch.distributed.breakpoint()
 
     ##### DEBUG #####
-    
-    # this is equal to 1 but it keeps the gradient flowing through the policy_logprobs without affecting the value of the pg_loss (it's only the advantages)
-    prob_ratio = torch.exp(policy_logprobs - policy_logprobs.detach()) # this is 1
-    pg_loss = -(prob_ratio * advantages) # equal to -advantages since we are maximizing the advantages.
-    
-    # KL penalty term using the improved approximation
-    kl_div = compute_kl_divergence(policy_logprobs, reference_logprobs)
-    num_clamped = (torch.abs(kl_div) > 10).sum().item()
-    kl_div = torch.clamp(kl_div, min=-10, max=10)
-    debug_print(f"\033[1;38;2;255;165;0m _compute_grpo_loss line 262: \033[0m num_clamped: {num_clamped}")
-    
-    # Combined loss
-    loss = pg_loss + kl_coeff * kl_div
-    
-    loss_metrics = (loss.detach()).sum().item()
-    pg_loss_metrics = (pg_loss.detach()).sum().item()
-    kl_div_metrics = (kl_div.detach()).sum().item()
-    start_time = time.time()
-    entropy_metrics = model_out.logits[output_indices].sum()
-    # print(f"Time taken to compute entropy: {time.time() - start_time} seconds", flush=True)
-    loss = loss.sum()
-    # torch.distributed.breakpoint()
+    pg_loss, neg_log_ratio, loss_clip1, loss_unclipped, loss_clipped, loss_clipped_dual, is_negative = policy_loss(
+        policy_logprobs=policy_logprobs,
+        old_logprobs=old_logprobs,
+        advantages=advantages,
+        output_indices=output_indices,
+        clip_low=clip_low,
+        clip_high=clip_high,
+        clip_ratio_c=clip_ratio_c,
+    )
 
-    return loss, loss_metrics, pg_loss_metrics, kl_div_metrics, entropy_metrics
+    # Track clipping and loss metrics
+    metrics = {
+        "loss": pg_loss.detach().item(),
+        "pg_loss": pg_loss.detach().item(),
+        "pg_clip": (loss_clipped > loss_unclipped).detach()[output_indices].sum().item(),
+        "pg_clip_lower": ((loss_clip1 > loss_clipped_dual) & is_negative).detach()[output_indices].sum().item(),
+        "kl_div": (-neg_log_ratio.detach())[output_indices].sum().item(),
+        "entropy": model_out.logits[output_indices].sum().item(),
+    }
+    return pg_loss, metrics
+    
+    # # this is equal to 1 but it keeps the gradient flowing through the policy_logprobs without affecting the value of the pg_loss (it's only the advantages)
+    # prob_ratio = torch.exp(policy_logprobs - policy_logprobs.detach()) # this is 1
+    # pg_loss = -(prob_ratio * advantages) # equal to -advantages since we are maximizing the advantages.
+    
+    # # KL penalty term using the improved approximation
+    # kl_div = compute_kl_divergence(policy_logprobs, reference_logprobs)
+    # num_clamped = (torch.abs(kl_div) > 10).sum().item()
+    # kl_div = torch.clamp(kl_div, min=-10, max=10)
+    # debug_print(f"\033[1;38;2;255;165;0m _compute_grpo_loss line 262: \033[0m num_clamped: {num_clamped}")
+    
+    # # Combined loss
+    # loss = pg_loss + kl_coeff * kl_div
+    
+    # loss_metrics = (loss.detach()).sum().item()
+    # pg_loss_metrics = (pg_loss.detach()).sum().item()
+    # kl_div_metrics = (kl_div.detach()).sum().item()
+    # start_time = time.time()
+    # entropy_metrics = model_out.logits[output_indices].sum()
+    # # print(f"Time taken to compute entropy: {time.time() - start_time} seconds", flush=True)
+    # loss = loss.sum()
+    # # torch.distributed.breakpoint()
+
+    # return loss, loss_metrics, pg_loss_metrics, kl_div_metrics, entropy_metrics
