@@ -106,7 +106,7 @@ def get_input_for_logprobs(batched_questions, output_indices, device):
     start_idx = 0
     for s in batched_questions:
         L_out = s['output_len']
-        # if this sample wasn’t truncated, copy its output token ids into labels
+        # if this sample wasn't truncated, copy its output token ids into labels
         if not s['truncated_sample']:
             idxs = output_indices[start_idx:start_idx + L_out] + 1      # +1 is your original offset
             labels[:, idxs] = batch_ids[:, idxs]
@@ -114,7 +114,42 @@ def get_input_for_logprobs(batched_questions, output_indices, device):
     # labels[:, output_indices+1] = batch_ids[:, output_indices+1]
     return batch_ids, batch_position_ids, labels
 
+def make_dummy_batch(batched_questions, device):
+    """Return a no-op dummy batch for synchronization without affecting metrics"""
+    input_ids = [11, 12, 13, 14]
+    batch_ids = torch.tensor([input_ids], dtype=torch.long, device=device)
+    batch_position_ids = torch.arange(len(input_ids), device=device).unsqueeze(0)
+    labels = torch.full((1, len(input_ids)), -100, dtype=torch.long, device=device)
+    output_indices = torch.empty((0,), dtype=torch.long, device=device)
+    advantages = torch.zeros(len(input_ids), device=device, dtype=torch.float32)
+    reference_output_logprobs = torch.zeros(len(input_ids), device=device, dtype=torch.float32)
+    output_lens_broadcasted = torch.zeros(len(input_ids), device=device, dtype=torch.float32)
+    return {
+        "batch_ids": batch_ids,
+        "batch_position_ids": batch_position_ids,
+        "output_indices": output_indices,
+        "advantages": advantages,
+        "reference_output_logprobs": reference_output_logprobs,
+        "output_lens_broadcasted": output_lens_broadcasted,
+        "num_output_tokens_non_masked": torch.tensor(0.0, device=device),
+        "num_output_tokens": torch.tensor(0.0, device=device, dtype=torch.float32),
+        "num_samples": torch.tensor(0.0, device=device, dtype=torch.float32),
+        "max_reward_in_group": torch.tensor(0.0, device=device, dtype=torch.float32),
+        "total_modified_reward": torch.tensor(0.0, device=device, dtype=torch.float32),
+        "total_non_modified_reward": torch.tensor(0.0, device=device, dtype=torch.float32),
+        "num_modified_samples": torch.tensor(0.0, device=device, dtype=torch.float32),
+        "delimiter_not_found": torch.tensor(0.0, device=device, dtype=torch.float32),
+        "samples": batched_questions,
+        "labels": labels,
+        "total_reward_rank": torch.tensor(0.0, device=device, dtype=torch.float32),
+        "truncated_sample": torch.tensor(0.0, device=device, dtype=torch.float32),
+        "advantage_is_zero": torch.tensor(0.0, device=device, dtype=torch.float32),
+    }
+
 def post_process_batch(batched_questions, device, constant_length_samples=None):
+    # Handle dummy batch: emit a minimal placeholder batch
+    if len(batched_questions) == 1 and batched_questions[0].get('dummy', False):
+        return make_dummy_batch(batched_questions, device)
     output_indices, output_lens = get_output_logits_indices(batched_questions, device)
     modified_samples = [q for q in batched_questions if q['modified_reward'] is not None]
     non_modified_samples = [q for q in batched_questions if q['modified_reward'] is None]

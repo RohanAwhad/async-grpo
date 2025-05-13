@@ -262,7 +262,7 @@ async def train(args,
                         advantage_is_zero=mb["advantage_is_zero"],
                         truncated_sample=mb["truncated_sample"],
                     )
-                elif msg.type in (MessageType.GRADIENT_STEP, MessageType.BATCH_DONE):
+                elif msg.type is MessageType.GRADIENT_STEP:
                     # reduce metrics, take gradient step
                     batch_totals.reduce_batch_metrics(accelerator)
                     bm = batch_totals.totals
@@ -303,21 +303,20 @@ async def train(args,
                             "batch_done": msg.type is MessageType.BATCH_DONE,
                         }
                         metric_logger.log_sync(metrics_to_log)
-                        if msg.type is MessageType.BATCH_DONE:
-                            # checkpoint if threshold reached
-                            if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
-                                save_model(args, policy_model, accelerator, total_samples_accumulated)
-                                last_saved_samples = total_samples_accumulated
-                            # broadcast updated weights
-                            registry_actor_names = (
-                                ["generation_vllm_registry", "logprob_vllm_registry"]
-                                if step == args.num_batches_per_ref_model_update - 1
-                                else ["generation_vllm_registry"]
-                            )
-                            update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=registry_actor_names)
-                    # reset metrics for next event
-                    batch_totals.reset_batch()
-                    # loop ends naturally after BATCH_DONE from the generator
+                        batch_totals.reset_batch()
+                elif msg.type is MessageType.BATCH_DONE and accelerator.is_main_process:
+                    # checkpoint if threshold reached
+                    if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
+                        save_model(args, policy_model, accelerator, total_samples_accumulated)
+                        last_saved_samples = total_samples_accumulated
+                    # broadcast updated weights
+                    registry_actor_names = (
+                        ["generation_vllm_registry", "logprob_vllm_registry"]
+                        if step == args.num_batches_per_ref_model_update - 1
+                        else ["generation_vllm_registry"]
+                    )
+                    update_vllm_worker_weights(policy_model, accelerator, registry_actor_names=registry_actor_names)
+                    
         
             
 

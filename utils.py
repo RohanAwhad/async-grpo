@@ -25,7 +25,11 @@ def init_distributed_environment(args):
     args.batcher_actor = get_or_create_experience_batcher(args.experience_batcher_name)
     args.actor_registry = ray.get_actor("generation_vllm_registry")
     args.reference_registry = ray.get_actor("logprob_vllm_registry")
-    ray.get(args.batcher_actor.register_training_process.remote(args.global_rank, args.max_tokens_per_gpu))
+    ray.get(args.batcher_actor.register_training_process.remote(
+        args.global_rank,
+        args.max_tokens_per_gpu,
+        args.train_minibatch_size
+    ))
     torch.distributed.barrier()
 
 def setup_logger(level="DEBUG"):

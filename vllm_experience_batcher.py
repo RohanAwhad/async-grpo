@@ -52,6 +52,7 @@ async def get_experience_and_ref_logprobs(sample, num_samples, actor_registry_ha
 class MessageType(Enum):
     MINIBATCH = "minibatch"
     GRADIENT_STEP = "gradient_step"
+    BATCH_DONE = "batch_done"
 
 @dataclass
 class Message:
@@ -69,13 +70,15 @@ class ExperienceBatcher:
         self.actor_registry_handle = ray.get_actor("generation_vllm_registry")
         self.reference_registry_handle = ray.get_actor("logprob_vllm_registry")
         self.lock = asyncio.Lock()
+        self.dispatched_since_last_grad_step = 0
+        self.train_minibatch_size = None
     
     def start_creating_batches(self):
         asyncio.create_task(self._create_batches())
 
-
-    def register_training_process(self, global_rank: int, max_tokens_per_gpu: int):
+    def register_training_process(self, global_rank: int, max_tokens_per_gpu: int, train_minibatch_size: int):
         self.max_tokens_per_gpu = max_tokens_per_gpu
+        self.train_minibatch_size = train_minibatch_size
         self.training_processes_queues[global_rank] = asyncio.Queue()
         self.training_batches[global_rank] = []
         self.training_batches_lengths[global_rank] = 0
@@ -83,15 +86,25 @@ class ExperienceBatcher:
     
 
     async def add_sample_to_batches(self, sample):
+        # Compute sample length and pick the batch to fill
         sample_len = sample['input_len'] + sample['output_len']
-        least_full_batch_id = min(self.training_batches_lengths, key=self.training_batches_lengths.get)
-        if self.training_batches_lengths[least_full_batch_id] + sample_len > self.max_tokens_per_gpu:
-        #   or all(len(batch) > 1 for batch in self.training_batches.values()):
-            dispatched = await self.dispatch_batches()
-            if not dispatched:
-                raise Exception("Didn't dispatch but can't add sample to batch because it exceeds max tokens per gpu")
-        self.training_batches[least_full_batch_id].append(sample)
-        self.training_batches_lengths[least_full_batch_id] += sample['input_len'] + sample['output_len']
+        least_id = min(self.training_batches_lengths, key=self.training_batches_lengths.get)
+        # If adding would overflow tokens, flush existing batches first
+        if self.training_batches_lengths[least_id] + sample_len > self.max_tokens_per_gpu:
+            num_dispatched = await self.dispatch_batches()
+            if num_dispatched == 0:
+                raise Exception("Token overflow with no batches to dispatch")
+            self.dispatched_since_last_grad_step += num_dispatched
+        # Add the new sample
+        self.training_batches[least_id].append(sample)
+        self.training_batches_lengths[least_id] += sample_len
+        # If we've exactly hit the train_minibatch_size, flush and trigger gradient
+        if self.dispatched_since_last_grad_step + sum([len(batch) for batch in self.training_batches.values()]) == self.train_minibatch_size:
+            num_dispatched = await self.dispatch_batches()
+            if not num_dispatched:
+                raise Exception("Reached minibatch size with no batches to dispatch")
+            await self.dispatch_signal(MessageType.GRADIENT_STEP)
+            self.dispatched_since_last_grad_step = 0
     
     async def reset_batches(self):
         for batch_id in self.training_batches:
@@ -99,18 +112,30 @@ class ExperienceBatcher:
             self.training_batches_lengths[batch_id] = 0
     
     async def dispatch_batches(self):
-        if all(len(batch) > 0 for batch in self.training_batches.values()):
-            for batch_id, batch in self.training_batches.items():
-                await self.training_processes_queues[batch_id].put(Message(MessageType.MINIBATCH, batch))
-            await self.reset_batches()
-            return True
-        else:
-            print(f"\033[1;31mCan't dispatch because there are {sum(True for batch in self.training_batches.values() if len(batch) > 0)} batches with samples out of {len(self.training_batches)} batches\033[0m")
-            return False
+        """
+        Emit exactly one MINIBATCH to each worker (with dummy fill for empty queues)
+        only if at least one batch contains real samples. Return True if sent.
+        """
+        # do nothing if no real samples anywhere
+        num_real_samples = 0
+        if not any(self.training_batches.values()):
+            return num_real_samples
 
-    async def dispatch_sentinel(self):
+        dummy_sample = {'dummy': True}
+        dispatch_tasks = []
+        for batch_id, batch in self.training_batches.items():
+            payload = batch if batch else [dummy_sample]
+            dispatch_tasks.append(self.training_processes_queues[batch_id].put(Message(MessageType.MINIBATCH, payload)))
+            num_real_samples += len(batch) if batch else 0
+        await asyncio.gather(*dispatch_tasks)
+        await self.reset_batches()
+        return num_real_samples
+
+    async def dispatch_signal(self, signal_type: MessageType):
+        """Send a signal to all workers."""
         for queue in self.training_processes_queues.values():
-            await queue.put(Message(MessageType.GRADIENT_STEP))
+            await queue.put(Message(signal_type))
+
 
     async def _create_batches(self):
         """Continuously consumes tasks from the experience_queue and processes them."""
@@ -125,11 +150,11 @@ class ExperienceBatcher:
             debug_log(f"Experience queue length in _create_batches after processing: {len(self.experience_queue)}")
             self.experience_queue = []
         
-            await self.dispatch_batches()
-            debug_log("Last batch dispatched")
-            await self.reset_batches()
-            await self.dispatch_sentinel()
-            debug_log("Sentinel dispatched")
+            num_dispatched = await self.dispatch_batches()
+            if num_dispatched > 0:
+                await self.dispatch_signal(MessageType.GRADIENT_STEP)
+            await self.dispatch_signal(MessageType.BATCH_DONE)
+            debug_log("Batch done dispatched")
 
     async def get_batch(self, global_rank: int):
         return await self.training_processes_queues[global_rank].get()
@@ -220,7 +245,7 @@ if __name__ == "__main__":
         namespace="test",
     ).remote()
     time.sleep(10)
-    ray.get(batcher.register_training_process.remote(0, 25000))
+    ray.get(batcher.register_training_process.remote(0, 25000, 100000))
     ray.get(batcher.generate_experience.remote([{'input_token_ids': [100264, 882, 100266, 4438, 1053, 499, 12849, 279, 8286, 315,
             264, 6211, 1903, 315, 279, 11552, 315, 1403, 66818, 315,
             279, 1890, 10801, 1405, 279, 19169, 72359, 449, 279, 7479,
