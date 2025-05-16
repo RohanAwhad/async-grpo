@@ -133,9 +133,9 @@ class ExperienceBatcher:
 
     async def dispatch_signal(self, signal_type: MessageType):
         """Send a signal to all workers."""
-        for queue in self.training_processes_queues.values():
+        for i, queue in enumerate(self.training_processes_queues.values()):
             await queue.put(Message(signal_type))
-
+            print(f"\033[1;38;2;255;20;147mDispatched signal:\033[0m {signal_type} \033[1;38;2;255;20;147mRank:\033[0m {i}")
 
     async def _create_batches(self):
         """Continuously consumes tasks from the experience_queue and processes them."""

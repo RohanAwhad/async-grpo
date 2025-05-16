@@ -71,7 +71,7 @@ def make_grpo_forward(model, loss_chunksize: int = None, temperature: float = 1.
 
         for i in range(0, T, loss_chunksize):
             end_idx = min(i + loss_chunksize, T)
-            logits = model.lm_head(hidden_states[:, i:end_idx, :]).float()/temperature
+            logits = model.lm_head(hidden_states[:, i:end_idx, :]).float().div_(temperature)
             loss, logits = model.loss_function(logits=logits, labels=shifted_labels[:, i:end_idx], vocab_size=model.config.vocab_size, **kwargs)
             total_loss.append(loss)
             entropy_list.append(entropy_from_logits(logits.detach().bfloat16()))
@@ -194,7 +194,7 @@ def entropy_from_logits(logits: torch.Tensor):
         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
     return entropy
 
-@torch.compile
+# @torch.compile
 def policy_loss(
     policy_logprobs: torch.Tensor,
     old_logprobs: torch.Tensor,
@@ -204,23 +204,25 @@ def policy_loss(
     clip_high: float,
     clip_ratio_c: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # negative_approx_kl = policy_logprobs - old_logprobs
-    # ratio = torch.exp(negative_approx_kl)
-    # # ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    negative_approx_kl = policy_logprobs - old_logprobs
+    ratio = torch.exp(negative_approx_kl)
+    # ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
-    # pg_losses1 = -advantages * ratio
-    # pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_low, 1 + clip_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
-    # clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    # # pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_low, 1 + clip_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    # pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
 
-    # pg_losses3 = -advantages * clip_ratio_c
-    # clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    # # pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    # pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
 
-    # pg_loss = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1).sum()
-    # # pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1).sum()
+    # pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     # return pg_loss, negative_approx_kl, clip_pg_losses1, pg_losses1, 
+
+    ##########
     neg_log_ratio = policy_logprobs - old_logprobs
     ratio = torch.exp(neg_log_ratio)
 

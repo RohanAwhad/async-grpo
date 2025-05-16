@@ -117,7 +117,7 @@ def setup_model(args, model=None):
     model.loss_function = PerTokenLogProbsFromCE
     if getattr(args, 'use_torch_compile', True):
         torch.compile(model.model)
-        torch.compile(model.loss_function)
+        # torch.compile(model.loss_function)
 
     if model.__class__.__name__ not in [
         "MistralForCausalLM",

@@ -102,6 +102,7 @@ def update_vllm_worker_weights(model, accelerator, registry_actor_names=["refere
     # Retrieve the state dict from the model.
     # log_rank_0(f"\033[1;32mStarting to update weights on {registry_actor_names}\033[0m")
     print(f"\033[1;32mStarting to update weights on {registry_actor_names} Rank: {accelerator.process_index}\033[0m")
+    torch.distributed.barrier()
     start = time.time()
     state_dict = accelerator.get_state_dict(model)
     
@@ -118,8 +119,8 @@ def update_vllm_worker_weights(model, accelerator, registry_actor_names=["refere
             tasks.extend([handle.update_weights.remote(new_state_dict=state_ref)
                         for handle in replica_handles])
         ray.get(tasks)
-        print(f"\033[1;32mUpdated weights on {registry_actor_names} in {time.time() - start:.2f} seconds\033[0m")
 
+    print(f"\033[1;38;2;0;191;255mUpdated weights on {registry_actor_names} in {time.time() - start:.2f} seconds Rank: {accelerator.process_index}\033[0m")
     torch.distributed.barrier()
     torch.cuda.empty_cache()
 
@@ -225,6 +226,7 @@ async def train(args,
         torch.distributed.barrier()
 
         event_start_time = time.time()
+        num_minibatches = 0
         async for msg in remote_event_generator(
             args.global_rank,
             device,
@@ -267,6 +269,8 @@ async def train(args,
                     advantage_is_zero=mb["advantage_is_zero"],
                     truncated_sample=mb["truncated_sample"],
                 )
+                num_minibatches += 1
+                print(f"\033[1;38;2;255;165;0mNum Minibatches:\033[0m {num_minibatches} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}")
             elif msg.type is MessageType.GRADIENT_STEP:
                 # reduce metrics, take gradient step
                 batch_totals.reduce_batch_metrics(accelerator)
@@ -310,7 +314,8 @@ async def train(args,
                     }
                     metric_logger.log_sync(metrics_to_log)
                     batch_totals.reset_batch()
-            elif msg.type is MessageType.BATCH_DONE and accelerator.is_main_process:
+            elif msg.type is MessageType.BATCH_DONE:
+                print(f"\033[1;38;2;255;165;0mBatch Done:\033[0m {total_samples_accumulated} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}")
                 # checkpoint if threshold reached
                 if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
                     save_model(args, policy_model, accelerator, total_samples_accumulated)
@@ -460,13 +465,5 @@ set -x log_dir /new_data/experiments_rh/phi_mini_2499716_deepscaler_128bs_8spq
 set -x rank 0
 mkdir -p $log_dir
 cd /new_data/aldo/v1_reasoning/grpo_feb_24th/
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nnodes=1 --node_rank=$rank --nproc_per_node=8 --rdzv_id=101 \
-    --rdzv_endpoint="10.241.128.19:54367" trainer_core.py \
-     --output_dir $log_dir 2>&1 \
-    | tee $log_dir/train_$rank.log
-# torchrun --nproc_per_node=4 trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
-set -x rank 0
-mkdir -p ~/grpo
-torchrun --nnodes=1 --node_rank=$rank --nproc_per_node=1 --rdzv_id=101 \
-    --rdzv_endpoint="10.241.128.19:54367" trainer_core.py 2>&1 | tee ~/grpo/train_countdown_3b.log
+set -x NCCL_SOCKET_IFNAME eth1; set -x NCCL_IB_DISABLE 1; set -x CUDA_VISIBLE_DEVICES 4,5,6,7; mamba activate grpo; cd /new_data/aldo/v1_reasoning/grpo_feb_24th/; torchrun   --nnodes=1   --node_rank=(math 1 - 1)   --nproc_per_node=4   --rdzv_id=101   --rdzv_endpoint=10.241.128.19:54367   trainer_core.py     --model-name-or-path         /dev/shm/DeepSeek-R1-Distill-Qwen-1.5B     --learning-rate              125e-8     --batch-size                 128     --lr-scheduler               constant_with_warmup     --num-warmup-steps           10     --fsdp-sharding-strategy     SHARD_GRAD_OP     --max-tokens-per-gpu         80000     --samples-per-question       8     --loss-chunksize             2048     --temperature                0.6     --max-generation-tokens      16000     --data-path                  /new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_r1_qwen1.5b.jsonl     --min-samples-per-checkpoint 30000     --output-dir                 /new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.25e-6_clipping_v1     --infinite-sampler-seed      53     --train-minibatch-size       128     --num-training-batches       1000000     --logging-level              INFO   2>&1 | tee /new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.25e-6_clipping_v1/train_1.log
 '''
