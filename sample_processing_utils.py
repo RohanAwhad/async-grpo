@@ -101,17 +101,10 @@ def get_input_for_logprobs(batched_questions, output_indices, device):
     batch_position_ids = torch.cat(
         [torch.tensor(s['sample_position_ids'], dtype=torch.long) for s in batched_questions]
     ).unsqueeze(0).to(device)
-    labels = torch.ones_like(batch_ids) * -100
-
-    start_idx = 0
-    for s in batched_questions:
-        L_out = s['output_len']
-        # if this sample wasn't truncated, copy its output token ids into labels
-        if not s['truncated_sample']:
-            idxs = output_indices[start_idx:start_idx + L_out] + 1      # +1 is your original offset
-            labels[:, idxs] = batch_ids[:, idxs]
-        start_idx += L_out
-    # labels[:, output_indices+1] = batch_ids[:, output_indices+1]
+    # Concatenate precomputed per-sample labels
+    labels = torch.cat(
+        [torch.tensor(s['labels'], dtype=torch.long) for s in batched_questions]
+    ).unsqueeze(0).to(device)
     return batch_ids, batch_position_ids, labels
 
 def make_dummy_batch(batched_questions, device):

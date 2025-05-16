@@ -256,6 +256,14 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             sample['sample_text'] = self.tokenizer.decode(sample['sample_ids'])
             sample['sample_position_ids'] = list(range(len(sample['sample_ids'])))
             sample['truncated_sample'] = sample['sample_ids'][-1] != self.tokenizer.eos_token_id
+            # Compute per-sample labels for logprobs
+            labels = [-100] * len(sample['sample_ids'])
+            if not sample['truncated_sample']:
+                for i in range(sample['output_len']):
+                    pos = sample['input_len'] + i
+                    labels[pos] = sample['sample_ids'][pos]
+            sample['labels'] = labels
+            sample['num_non_masked_output_tokens'] = sum(1 for label in labels if label != -100)
             # Use the remote call because verifier_pool is now a ray actor
             sample_rewards_futures.append(
                 self.verifier_pool.verify_balanced.remote(
@@ -284,6 +292,13 @@ class GenerationVLLMWorker(BaseVLLMWorker):
                 modified_sample['output_len'] = len(modified_sample['output_token_ids'])
                 modified_sample['sample_text'] = self.tokenizer.decode(modified_sample['sample_ids'])
                 modified_sample['sample_position_ids'] = list(range(len(modified_sample['sample_ids'])))
+                # Compute per-sample labels for logprobs
+                labels = [-100] * len(modified_sample['sample_ids'])
+                if not modified_sample['truncated_sample']:
+                    for i in range(modified_sample['output_len']):
+                        pos = modified_sample['input_len'] + i
+                        labels[pos] = modified_sample['sample_ids'][pos]
+                modified_sample['labels'] = labels
                 modified_rewards_futures.append(
                     self.verifier_pool.verify_balanced.remote(
                         modified_sample,

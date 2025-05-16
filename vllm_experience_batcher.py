@@ -86,6 +86,17 @@ class ExperienceBatcher:
     
 
     async def add_sample_to_batches(self, sample):
+        """
+        Add a single sample into per-GPU token-limited batches, dispatching microbatches as needed.
+
+        Responsibilities:
+        - Compute the token length of the sample and choose the least-loaded GPU batch by token count.
+        - If adding the sample exceeds max_tokens_per_gpu, dispatch existing microbatches first via dispatch_batches().
+        - Append the sample to the chosen GPU batch and update its token-length counter.
+        - Increment dispatched_since_last_grad_step by the number of samples just sent.
+        - When the cumulative number of samples dispatched equals train_minibatch_size, dispatch all batches and emit a GRADIENT_STEP signal.
+        - dispatch_batches() handles sending MINIBATCH messages and resetting per-GPU buffers.
+        """
         # Compute sample length and pick the batch to fill
         sample_len = sample['input_len'] + sample['output_len']
         least_id = min(self.training_batches_lengths, key=self.training_batches_lengths.get)
@@ -137,6 +148,16 @@ class ExperienceBatcher:
             await queue.put(Message(signal_type))
             print(f"\033[1;38;2;255;20;147mDispatched signal:\033[0m {signal_type} \033[1;38;2;255;20;147mRank:\033[0m {i}")
 
+    async def _flush_ready_samples(self):
+        """Attach total_non_masked_output_tokens and forward samples to add_sample_to_batches."""
+        # Compute total non-masked output tokens for current minibatch
+        total_tokens = sum(s['num_non_masked_output_tokens'] for s in self.ready_experience_samples)
+        for sample in self.ready_experience_samples:
+            sample['total_non_masked_output_tokens'] = total_tokens
+            await self.add_sample_to_batches(sample)
+        # Clear the minibatch buffer
+        self.ready_experience_samples.clear()
+
     async def _create_batches(self):
         """Continuously consumes tasks from the experience_queue and processes them."""
         async with self.lock:
@@ -146,8 +167,15 @@ class ExperienceBatcher:
                 if samples is None: # underlying coroutine timed out
                     continue
                 for sample in samples:
-                    await self.add_sample_to_batches(sample)
+                    # Stage One: buffer samples until we have a full minibatch
+                    self.ready_experience_samples.append(sample)
+                    if len(self.ready_experience_samples) >= self.train_minibatch_size:
+                        await self._flush_ready_samples()
             debug_log(f"Experience queue length in _create_batches after processing: {len(self.experience_queue)}")
+            # After processing all tasks, flush any remaining samples
+            if self.ready_experience_samples:
+                await self._flush_ready_samples()
+            # Clear the experience queue
             self.experience_queue = []
         
             num_dispatched = await self.dispatch_batches()
