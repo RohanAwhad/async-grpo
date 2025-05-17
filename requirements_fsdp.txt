@@ -1,5 +1,5 @@
 --extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.5.1
+torch<2.7
 torchvision
 transformers #==4.48.3
 datasets
