@@ -2,10 +2,7 @@ from copy import deepcopy
 import math
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, get_scheduler
-from accelerate import Accelerator
-from torch.distributed.fsdp import BackwardPrefetch, MixedPrecision, ShardingStrategy
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from functools import partial
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
 from utils import log_rank_0
 from grpo_loss import PerTokenLogProbsFromCE, make_grpo_forward
@@ -24,46 +21,6 @@ def get_module_class_from_name(
             module_class = get_module_class_from_name(child_module, name)
             if module_class is not None:
                 return module_class
-
-def get_fsdp_config(args, model: PreTrainedModel):
-    # Third Party
-    from accelerate.utils import FullyShardedDataParallelPlugin
-    from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
-
-    block_name = model._no_split_modules[0]
-    fsdp_plugin = FullyShardedDataParallelPlugin(
-        auto_wrap_policy=partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls={
-                get_module_class_from_name(model, block_name),
-            },
-        ),
-        limit_all_gathers=True,
-        # mixed_precision_policy=MixedPrecision(
-        #     param_dtype=torch.bfloat16,
-        #     reduce_dtype=torch.bfloat16,
-        #     buffer_dtype=torch.bfloat16,
-        # ),
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        sharding_strategy=ShardingStrategy[args.fsdp_sharding_strategy],
-        # sync_module_states=True,
-        # param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False),
-        #     # if torch.distributed.get_rank()!=0 else None,
-        # cpu_ram_efficient_loading=True,
-        use_orig_params=True,
-        state_dict_type="full_state_dict",
-    )
-
-    return fsdp_plugin
-
-
-def setup_accelerator(args, model: PreTrainedModel):
-    accelerator = Accelerator(
-        fsdp_plugin=get_fsdp_config(args, model),
-        mixed_precision="bf16",
-    )
-    accelerator.even_batches = False
-    return accelerator
 
 def align_model_and_tokenizer(model, tokenizer):
     """
@@ -117,7 +74,7 @@ def setup_model(args, model=None):
     model.loss_function = PerTokenLogProbsFromCE
     if getattr(args, 'use_torch_compile', True):
         torch.compile(model.model)
-        # torch.compile(model.loss_function)
+        torch.compile(model.loss_function)
 
     if model.__class__.__name__ not in [
         "MistralForCausalLM",
@@ -137,24 +94,50 @@ def setup_model(args, model=None):
     # torch.compile(model)
     return model
 
+def wrap_fsdp2(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Wrap `model` in PyTorch FSDP2 with full sharding and transformer auto-wrap policy under BF16.
+    """
+    # Determine the block class to auto-wrap (first no-split module)
+    block_name = model._no_split_modules[0]
+    block_cls = get_module_class_from_name(model, block_name)
+    if block_cls is None:
+        raise ValueError(f"Could not find module class named {block_name}")
+    # Mixed-precision policy for BF16
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        cast_forward_inputs=True,
+    )
+    # FSDP2 settings: full shard, BF16, no CPU offload
+    fsdp2_kwargs = {
+        "mp_policy": mp_policy,
+        "reshard_after_forward": True,
+    }
+    # Auto-wrap child modules
+    for module in model.modules():
+        if isinstance(module, block_cls):
+            fully_shard(module, **fsdp2_kwargs)
+    # Wrap the full model
+    fully_shard(model, **fsdp2_kwargs)
+    # Cast back to float32
+    model = model.to(torch.float32)
+    return model
+
 def setup_training_components(args, model):
-    accelerator = setup_accelerator(args, model)
-    model = accelerator.prepare(model)
+    model = wrap_fsdp2(model)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.95),
         weight_decay=0.0,
     )
-    model, optimizer = accelerator.prepare(model, optimizer)
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.num_warmup_steps,
     )
-    # Necessary so that Accelerate does not step once per GPU
-    # see https://github.com/huggingface/accelerate/blob/127818fc27ebe5cb236357fff59ff1748326d643/src/accelerate/scheduler.py#L69
     lr_scheduler.split_batches = True
-    lr_scheduler.step() #the scheduler starts at 0 and there's no learning.
-    accelerator.register_for_checkpointing(lr_scheduler)
-    return model, accelerator, optimizer, lr_scheduler
+    lr_scheduler.step()  # the scheduler starts at 0 and there's no learning.
+    return model, optimizer, lr_scheduler

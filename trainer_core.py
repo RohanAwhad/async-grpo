@@ -8,8 +8,6 @@ import json
 
 import torch
 import ray
-from accelerate import Accelerator
-import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
 import torch.distributed as dist
 from datasets import load_dataset
@@ -87,27 +85,27 @@ def get_dataloader(global_batch_size: int, path: str = "/new_data/aldo/v1_reason
     sampler = InfiniteDistributedSampler(dataset, seed=sampler_seed)
     return DataLoader(dataset, batch_size=local_batch_size, sampler=sampler, num_workers=4, collate_fn=lambda batch: batch)
 
-def update_vllm_worker_weights(model, accelerator, registry_actor_names=["reference_model_registry", "actor_model_registry"]):
+def update_vllm_worker_weights(model, registry_actor_names=["reference_model_registry", "actor_model_registry"]):
     """
     Update the weights on all vLLM actors using the state dict obtained from the model.
     
     Args:
         model: The model whose weights should be updated on the remote actors.
-        accelerator: The Accelerator instance (with accelerator.is_main_process).
         registry_actor_names: The names of the registries to update (the reference model and/or the actor models)
     
     Returns:
         The list of results from the update operations if on the main process; otherwise, None.
     """
-    # Retrieve the state dict from the model.
-    # log_rank_0(f"\033[1;32mStarting to update weights on {registry_actor_names}\033[0m")
-    print(f"\033[1;32mStarting to update weights on {registry_actor_names} Rank: {accelerator.process_index}\033[0m")
+    rank = torch.distributed.get_rank()
+    print(f"\033[1;32mStarting to update weights on {registry_actor_names} Rank: {rank}\033[0m")
     torch.distributed.barrier()
     start = time.time()
-    state_dict = accelerator.get_state_dict(model)
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+    state_dict = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True))
+    state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
     
     # Only the main process performs the update.
-    if accelerator.is_main_process:
+    if rank == 0:
         # Use ray.put to upload the state dict to the Ray object store.
         state_ref = ray.put(state_dict)
         tasks = []
@@ -120,24 +118,48 @@ def update_vllm_worker_weights(model, accelerator, registry_actor_names=["refere
                         for handle in replica_handles])
         ray.get(tasks)
 
-    print(f"\033[1;38;2;0;191;255mUpdated weights on {registry_actor_names} in {time.time() - start:.2f} seconds Rank: {accelerator.process_index}\033[0m")
+    print(f"\033[1;38;2;0;191;255mUpdated weights on {registry_actor_names} in {time.time() - start:.2f} seconds Rank: {rank}\033[0m")
     torch.distributed.barrier()
     torch.cuda.empty_cache()
 
-def save_model(args, model, accelerator, samples_seen):
+def save_model(fsdp_model, samples_seen, output_dir, model_name_or_path):
+    from huggingface_hub import split_torch_state_dict_into_shards
+    from transformers import AutoTokenizer
+    from safetensors.torch import save_file
+    # Only on rank 0
     log_rank_0(f"Saving model at {samples_seen} samples")
     start = time.time()
-    output_dir = Path(args.output_dir) / "hf_format" / f"samples_{samples_seen}"
-    accelerator.save_model(model,
-                           str(output_dir),
-                            max_shard_size="20GB",
-                            safe_serialization=True,
-    )
-    if accelerator.is_main_process:
-        model.module.config.to_json_file(str(output_dir / "config.json"))
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-        tokenizer.save_pretrained(output_dir)
+    rank = torch.distributed.get_rank()
+    save_directory = Path(output_dir) / "hf_format" / f"samples_{samples_seen}"
+    os.makedirs(save_directory, exist_ok=True)
+    # Get full state dict
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+    state_dict = get_model_state_dict(fsdp_model, options=StateDictOptions(full_state_dict=True))
+    state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
+    if rank == 0:
+        pattern = "model{suffix}.safetensors"
+        index_name = "model.safetensors.index.json"
+        # Shard splitting
+        split = split_torch_state_dict_into_shards(
+            state_dict, filename_pattern=pattern, max_shard_size="5GB",
+        )
+        # Save shards
+        for filename, tensors in split.filename_to_tensors.items():
+            shard = {k: state_dict[k] for k in tensors}
+            path = os.path.join(save_directory, filename)
+            save_file(shard, path)
+        # Save index if sharded
+        if split.is_sharded:
+            index = {"metadata": split.metadata, "weight_map": split.tensor_to_filename}
+            with open(os.path.join(save_directory, index_name), "w") as f:
+                json.dump(index, f, indent=2, sort_keys=True)
+        # Save config and tokenizer (unwrap inner module)
+        inner = getattr(fsdp_model, "module", fsdp_model)
+        inner.config.to_json_file(os.path.join(save_directory, "config.json"))
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        tokenizer.save_pretrained(save_directory)
         log_rank_0(f"\033[1;38;2;0;255;255mSaved model at\033[0m {samples_seen} samples in {time.time() - start:.2f} seconds")
+    torch.distributed.barrier()
 
 async def remote_event_generator(global_rank: int,
                                        device: torch.device,
@@ -154,10 +176,11 @@ async def remote_event_generator(global_rank: int,
             break
 
 
-def take_gradient_step(model, optimizer, lr_scheduler, accelerator):
+def take_gradient_step(model, optimizer, lr_scheduler):
     """Scales gradients, applies clipping, and takes an optimization step."""
-    grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
-    print(f"\033[1;38;2;255;165;0mGlobal Grad Norm:\033[0m {grad_norm} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}")
+    rank = torch.distributed.get_rank()
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    print(f"\033[1;38;2;255;165;0mGlobal Grad Norm:\033[0m {grad_norm} \033[1;38;2;255;165;0mRank:\033[0m {rank}")
     optimizer.step()
     lr_scheduler.step()
     optimizer.zero_grad()
@@ -167,21 +190,22 @@ async def train(args,
                 policy_model, 
                 optimizer,
                 lr_scheduler,
-                accelerator: Accelerator,
                 ):
     """
     Main training loop following Algorithm 1 from the paper.
     Simplified version since with μ=1, π_old = π_current during sampling.
     """
     policy_model.train()
+    rank = torch.distributed.get_rank()
+    is_main_process = torch.distributed.get_rank() == 0
     dataloader = iter(get_dataloader(args.batch_size, path=args.data_path, sampler_seed=args.infinite_sampler_seed))
     
-    device = accelerator.device
+    device = next(policy_model.parameters()).device
     world_size = int(os.environ["WORLD_SIZE"])
 
     batcher_actor = ray.get_actor(args.experience_batcher_name, namespace="test")
 
-    if accelerator.is_main_process:
+    if is_main_process:
         metric_logger = AsyncStructuredLogger(os.path.join(args.output_dir, f"training_metrics.jsonl"))
 
     total_samples_accumulated = 0
@@ -206,7 +230,7 @@ async def train(args,
             timeout=1200 # 20 minutes per batch of questions or skipped. --> adjust depending on settings.
         )
         torch.distributed.barrier()
-        if accelerator.is_main_process:
+        if is_main_process:
             ray.get(batcher_actor.start_creating_batches.remote())
         torch.distributed.barrier()
 
@@ -234,7 +258,7 @@ async def train(args,
                 # Scale loss by world size and normalize by total non-masked output tokens
                 total_non_masked_tokens = mb["samples"][0]["total_non_masked_output_tokens"]
                 loss *= world_size / (total_non_masked_tokens + 2e-6)
-                accelerator.backward(loss)
+                loss.backward()
                 torch.cuda.empty_cache()
 
                 batch_totals.accumulate_minibatch_metrics(
@@ -258,7 +282,7 @@ async def train(args,
                     truncated_sample=mb["truncated_sample"],
                 )
                 num_microbatches += 1
-                print(f"\033[1;38;2;255;165;0mNum microbatches:\033[0m {num_microbatches} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}")
+                print(f"\033[1;38;2;255;165;0mNum microbatches:\033[0m {num_microbatches} \033[1;38;2;255;165;0mRank:\033[0m {rank}")
             elif msg.type is MessageType.GRADIENT_STEP:
                 # reduce metrics, take gradient step
                 batch_totals.reduce_batch_metrics(device)
@@ -266,9 +290,9 @@ async def train(args,
                 total_samples_accumulated += bm["samples"]
 
                 grad_norm = take_gradient_step(
-                    policy_model, optimizer, lr_scheduler, accelerator,
+                    policy_model, optimizer, lr_scheduler,
                 )
-                if accelerator.is_main_process:
+                if is_main_process:
                     # compute timing since event start
                     batch_time = time.time() - event_start_time
                     event_start_time = time.time()
@@ -305,15 +329,14 @@ async def train(args,
                     metric_logger.log_sync(metrics_to_log)
                     batch_totals.reset_batch()
             elif msg.type is MessageType.BATCH_DONE:
-                print(f"\033[1;38;2;255;165;0mBatch Done:\033[0m {total_samples_accumulated} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}")
+                print(f"\033[1;38;2;255;165;0mBatch Done:\033[0m {total_samples_accumulated} \033[1;38;2;255;165;0mRank:\033[0m {rank}")
                 # checkpoint if threshold reached
                 if total_samples_accumulated >= (args.min_samples_per_checkpoint + last_saved_samples):
-                    save_model(args, policy_model, accelerator, total_samples_accumulated)
+                    save_model(policy_model, total_samples_accumulated, args.output_dir, args.model_name_or_path)
                     last_saved_samples = total_samples_accumulated
                 # update both generation and reference logprobs every batch
                 update_vllm_worker_weights(
                     policy_model,
-                    accelerator,
                     registry_actor_names=["generation_vllm_registry", "logprob_vllm_registry"]
                 )
 
@@ -322,13 +345,6 @@ app = Typer(
     pretty_exceptions_show_locals=False,  # Hide local variables in tracebacks
     pretty_exceptions_short=True   
 )
-
-class FSDPShardingStrategyEnum(str, Enum):
-    NO_SHARD = "NO_SHARD"
-    SHARD_GRAD_OP = "SHARD_GRAD_OP"
-    FULL_SHARD = "FULL_SHARD"
-    HYBRID_SHARD = "HYBRID_SHARD"
-    _HYBRID_SHARD_ZERO2 = "_HYBRID_SHARD_ZERO2"
 
 class LogLevelEnum(str, Enum):
     DEBUG = "DEBUG"
@@ -344,11 +360,6 @@ def main(
     batch_size: int = Option(128, help="Global batch size of questions per gradient step. The batch will be split among GPUs even if not divisible by the number of GPUs."),
     lr_scheduler: str = Option("constant_with_warmup", help="Type of learning rate scheduler to use."),
     num_warmup_steps: int = Option(10, help="Number of warmup steps for the scheduler."),
-    fsdp_sharding_strategy: FSDPShardingStrategyEnum = Option(
-        FSDPShardingStrategyEnum.SHARD_GRAD_OP, 
-        help="Sharding strategy for Fully Sharded Data Parallel.",
-        case_sensitive=False
-    ),
     experience_batcher_name: str = Option("experience_batcher", help="Name of the experience batcher actor."),
     max_tokens_per_gpu: int = Option(36000, help="Maximum number of tokens per GPU."),
     loss_chunksize: int = Option(None, help="Number of tokens to process at a time for the loss computation. This avoids creating the logits matrix all at once in memory. None means no chunking."),
@@ -381,7 +392,6 @@ def main(
         batch_size=batch_size,
         lr_scheduler=lr_scheduler,
         num_warmup_steps=num_warmup_steps,
-        fsdp_sharding_strategy=fsdp_sharding_strategy.value,
         experience_batcher_name=experience_batcher_name,
         max_tokens_per_gpu=max_tokens_per_gpu,
         loss_chunksize=loss_chunksize,
@@ -421,17 +431,9 @@ def main(
 
     init_distributed_environment(args)
     model = setup_model(args)
-    model, accelerator, optimizer, lr_scheduler = setup_training_components(args, model)
+    model, optimizer, lr_scheduler = setup_training_components(args, model)
 
-    asyncio.run(
-        train(
-            args,
-            model, 
-            optimizer,
-            lr_scheduler,
-            accelerator=accelerator,
-        )
-    )
+    asyncio.run(train(args, model, optimizer, lr_scheduler))
 
 if __name__ == "__main__":
     app()
