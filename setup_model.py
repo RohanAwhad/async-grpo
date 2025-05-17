@@ -72,7 +72,7 @@ def setup_model(args, model=None):
     model = align_model_and_tokenizer(model, tokenizer)
     model = make_grpo_forward(model, args.loss_chunksize, args.temperature)
     model.loss_function = PerTokenLogProbsFromCE
-    if getattr(args, 'use_torch_compile', True):
+    if getattr(args, 'use_torch_compile', False):
         torch.compile(model.model)
         torch.compile(model.loss_function)
 

@@ -101,8 +101,7 @@ def update_vllm_worker_weights(model, registry_actor_names=["reference_model_reg
     torch.distributed.barrier()
     start = time.time()
     from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
-    state_dict = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True))
-    state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
+    state_dict = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
     
     # Only the main process performs the update.
     if rank == 0:
@@ -328,6 +327,8 @@ async def train(args,
                     }
                     metric_logger.log_sync(metrics_to_log)
                     batch_totals.reset_batch()
+                    torch.cuda.empty_cache()
+
             elif msg.type is MessageType.BATCH_DONE:
                 print(f"\033[1;38;2;255;165;0mBatch Done:\033[0m {total_samples_accumulated} \033[1;38;2;255;165;0mRank:\033[0m {rank}")
                 # checkpoint if threshold reached
@@ -379,7 +380,11 @@ def main(
     train_minibatch_size: int = Option(4000, help="Number of samples after which to trigger a GRADIENT_STEP message."),
     logging_level: LogLevelEnum = Option(LogLevelEnum.INFO, help="Logging level", case_sensitive=False),
     global_rank: int = Option(int(os.environ.get("RANK", 0)), help="Global rank of the process."), # Add global_rank from env
-    use_torch_compile: bool = Option(True, help="Use torch.compile to speed up training."),
+    use_torch_compile: bool = Option(
+        True,
+        "--use-torch-compile/--no-use-torch-compile",
+        help="Enable or disable torch.compile to speed up training.",
+    ),
 ):
     """
     Main training entry point for Async GRPO.

@@ -95,6 +95,7 @@ def make_grpo_forward(model, loss_chunksize: int = None, temperature: float = 1.
 # coming from the fact that logprobs equivalent to -CrossEntropyLoss(logits, labels)
 # this is a modification that does exactly the same except that there's no reduction
 # and we return the per-token log probabilities as -CrossEntropyLoss(logits, labels)
+# @torch.compile
 def PerTokenLogProbsFromCE(
     logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
 ):
@@ -186,7 +187,7 @@ def compute_kl_divergence(
 #     """
 #     return (loss/output_lens_broadcasted).sum()/num_samples
 
-@torch.compile
+# @torch.compile
 def entropy_from_logits(logits: torch.Tensor):
     """Calculate entropy from logits."""
     with torch.no_grad():
