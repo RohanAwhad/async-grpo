@@ -261,7 +261,7 @@ async def train(args,
                 print(f"\033[1;38;2;255;165;0mNum microbatches:\033[0m {num_microbatches} \033[1;38;2;255;165;0mRank:\033[0m {accelerator.process_index}")
             elif msg.type is MessageType.GRADIENT_STEP:
                 # reduce metrics, take gradient step
-                batch_totals.reduce_batch_metrics(accelerator)
+                batch_totals.reduce_batch_metrics(device)
                 bm = batch_totals.totals
                 total_samples_accumulated += bm["samples"]
 
