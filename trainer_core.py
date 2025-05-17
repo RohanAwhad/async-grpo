@@ -233,7 +233,7 @@ async def train(args,
 
                 # Scale loss by world size and normalize by total non-masked output tokens
                 total_non_masked_tokens = mb["samples"][0]["total_non_masked_output_tokens"]
-                loss *= world_size / total_non_masked_tokens
+                loss *= world_size / (total_non_masked_tokens + 2e-6)
                 accelerator.backward(loss)
                 torch.cuda.empty_cache()
 

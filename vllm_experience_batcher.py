@@ -132,7 +132,7 @@ class ExperienceBatcher:
         if not any(self.training_batches.values()):
             return num_real_samples
 
-        dummy_sample = {'dummy': True}
+        dummy_sample = {'dummy': True, 'total_non_masked_output_tokens': 0}
         dispatch_tasks = []
         for batch_id, batch in self.training_batches.items():
             payload = batch if batch else [dummy_sample]
