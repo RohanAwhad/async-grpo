@@ -19,7 +19,7 @@ from grpo_loss import compute_dual_clip_grpo_loss
 from utils import init_distributed_environment, log_rank_0, setup_logger, ArgsNamespace
 from sample_processing_utils import post_process_batch
 from batch_metrics import BatchMetrics
-from async_structured_logger import AsyncStructuredLogger
+from file_writer_actor import get_or_create_filewriter
 from vllm_experience_batcher import MessageType
 
 
@@ -188,8 +188,7 @@ def take_gradient_step(model, optimizer, lr_scheduler):
 async def train(args,
                 policy_model, 
                 optimizer,
-                lr_scheduler,
-                ):
+                lr_scheduler):
     """
     Main training loop following Algorithm 1 from the paper.
     Simplified version since with μ=1, π_old = π_current during sampling.
@@ -204,8 +203,16 @@ async def train(args,
 
     batcher_actor = ray.get_actor(args.experience_batcher_name, namespace="test")
 
+    # Set up loggers and dumpers
+    metric_logger = None
     if is_main_process:
-        metric_logger = AsyncStructuredLogger(os.path.join(args.output_dir, f"training_metrics.jsonl"))
+        metrics_file = os.path.join(args.output_dir, "training_metrics.jsonl")
+        metric_logger = get_or_create_filewriter("metrics_writer", metrics_file)
+    # Set up sample dumper actor if requested (submits across machines)
+    dumper = None
+    if args.dump_samples_filename:
+        samples_file = os.path.join(args.output_dir, args.dump_samples_filename)
+        dumper = get_or_create_filewriter("samples_writer", samples_file)
 
     total_samples_accumulated = 0
     last_saved_samples = 0
@@ -244,6 +251,9 @@ async def train(args,
             constant_length_samples=args.constant_length_samples,
         ):
             if msg.type is MessageType.MINIBATCH:
+                if dumper:
+                    for sample in msg.data:
+                        dumper.append.remote(sample, timestamp=False, print_console=False)
                 mb = post_process_batch(msg.data, device, constant_length_samples=args.constant_length_samples)
                 # Compute dual-clip PPO loss and associated metrics
                 loss, metrics = compute_dual_clip_grpo_loss(
@@ -325,7 +335,8 @@ async def train(args,
                         "entropy": bm["entropy"] / bm["output_tokens"],
                         "batch_done": msg.type is MessageType.BATCH_DONE,
                     }
-                    metric_logger.log_sync(metrics_to_log)
+                    if metric_logger:
+                        metric_logger.append.remote(metrics_to_log, timestamp=True, print_console=True)
                     batch_totals.reset_batch()
                     torch.cuda.empty_cache()
 
@@ -373,6 +384,7 @@ def main(
     infinite_sampler_seed: int = Option(37, help="Seed for InfiniteDistributedSampler, used to shuffle the data loader."),
     samples_per_question: int = Option(32, help="Number of samples per question to use in training."),
     constant_length_samples: int = Option(None, help="If set, forces all samples to be treated as having this output length for broadcasting advantages and other values. Defaults to None (use actual output lengths)."),
+    dump_samples_filename: str = Option(None, help="Filename (in output_dir) to which raw samples will be appended as JSONL; no dumping if None."),
     clip_low: float = Option(0.2, help="Lower epsilon for PPO dual-clip algorithm (ratio >= 1 - clip_low)."),
     clip_high: float = Option(0.28, help="Upper epsilon for PPO dual-clip algorithm (ratio <= 1 + clip_high)."),
     clip_ratio_c: float = Option(10.0, help="Dual clip constant c for negative advantages."),
@@ -409,6 +421,7 @@ def main(
         infinite_sampler_seed=infinite_sampler_seed,
         samples_per_question=samples_per_question,
         constant_length_samples=constant_length_samples,
+        dump_samples_filename=dump_samples_filename,
         clip_low=clip_low,
         clip_high=clip_high,
         clip_ratio_c=clip_ratio_c,
@@ -418,9 +431,10 @@ def main(
         use_torch_compile=use_torch_compile,
     )
     
+    # Ensure output directory exists
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     # Log parameters only on rank 0
     if args.global_rank == 0:
         params_to_log = args.__dict__.copy()
@@ -428,7 +442,7 @@ def main(
             "logging_level": logging_level.value,
             "WORLD_SIZE": int(os.environ.get("WORLD_SIZE", 1))
         })
-        params_path = output_path / f"training_params.json"
+        params_path = Path(output_dir) / f"training_params.json"
         with open(params_path, 'w') as f:
             json.dump(params_to_log, f, indent=4)
         print(f"Training with parameters: {json.dumps(params_to_log, separators=(',', ':'), indent=4)}")
@@ -438,6 +452,7 @@ def main(
     model = setup_model(args)
     model, optimizer, lr_scheduler = setup_training_components(args, model)
 
+    # Launch training, sample dumper actor handled inside train()
     asyncio.run(train(args, model, optimizer, lr_scheduler))
 
 if __name__ == "__main__":
