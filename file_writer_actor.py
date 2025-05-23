@@ -2,13 +2,15 @@
 
 import os
 import json
+import numpy as np
+import torch
 import ray
 from datetime import datetime
 
 @ray.remote
 class FileWriterActor:
     """
-    Ray actor that synchronously appends JSON records to a file with OS-level locks.
+    Ray actor that synchronously appends JSON records
     Supports timestamping and optional console printing.
     """
     def __init__(self, file_path: str):
@@ -25,17 +27,21 @@ class FileWriterActor:
         :param timestamp: if True, add a 'timestamp' key
         :param print_console: if True, also print the record
         """
-        # Prepare record copy if needed
-        rec = dict(record) if timestamp else record
         if timestamp:
-            rec['timestamp'] = datetime.now().isoformat()
-        line = json.dumps(rec, separators=(',', ':'), ensure_ascii=False) + '\n'
+            record['timestamp'] = datetime.now().isoformat()
+        # Sanitize scalar numpy and torch tensor values
+        for k, v in record.items():
+            if isinstance(v, torch.Tensor):
+                record[k] = v.item()
+            elif isinstance(v, np.generic):
+                record[k] = v.item()
+        line = json.dumps(record, separators=(',', ':'), ensure_ascii=False) + '\n'
         # Actor execution is single-threaded per actor, so no explicit lock needed
         with open(self.file_path, 'a') as f:
             f.write(line)
         # Optional console output
         if print_console:
-            print(f"\033[92m{json.dumps(rec, indent=4)}\033[0m")
+            print(f"\033[92m{json.dumps(record, indent=4)}\033[0m")
 
 
 def get_or_create_filewriter(actor_name: str, file_path: str):
