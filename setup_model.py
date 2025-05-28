@@ -1,6 +1,7 @@
 from copy import deepcopy
 import math
 import torch
+import torch.distributed
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, get_scheduler
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
@@ -74,7 +75,7 @@ def setup_model(args, model=None):
     
     mode = getattr(args, 'mode', 'eval')
     temperature = getattr(args, 'temperature', 1.0)
-    model = make_grpo_forward(model, temperature, mode=mode, use_torch_compile=getattr(args, 'use_torch_compile', True))
+    model = make_grpo_forward(model, temperature, mode=mode, use_torch_compile=getattr(args, 'use_torch_compile', False))
 
     if model.__class__.__name__ not in [
         "MistralForCausalLM",
@@ -93,7 +94,7 @@ def setup_model(args, model=None):
     # torch.compile(model)
     return model
 
-def wrap_fsdp2(model: torch.nn.Module) -> torch.nn.Module:
+def wrap_fsdp2(model: torch.nn.Module, use_torch_compile: bool = False) -> torch.nn.Module:
     """
     Wrap `model` in PyTorch FSDP2 with full sharding and transformer auto-wrap policy under BF16.
     """
@@ -122,10 +123,12 @@ def wrap_fsdp2(model: torch.nn.Module) -> torch.nn.Module:
     fully_shard(model, **fsdp2_kwargs)
     # Cast back to float32
     model = model.to(torch.float32)
+    if use_torch_compile:
+        model = torch.compile(model)
     return model
 
 def setup_training_components(args, model):
-    model = wrap_fsdp2(model)
+    model = wrap_fsdp2(model, args.use_torch_compile)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,

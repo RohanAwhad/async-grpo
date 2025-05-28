@@ -107,29 +107,31 @@ torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py --output-dir /pa
 ```
 
 Hyperparameters can be passed as arguments or adjusted directly in `trainer_core.py`:
-```
+```bash
 --model-name-or-path <path_or_id> \\
 --learning-rate <float> \\
 --batch-size <int> \\
 --lr-scheduler <scheduler_name> \\
 --num-warmup-steps <int> \\
---fsdp-sharding-strategy <strategy> \\
+--experience-batcher-name <str> \\
 --max-tokens-per-gpu <int> \\
---samples-per-question <int> \\
---loss-chunksize <int_or_None> \\
 --temperature <float> \\
 --max-generation-tokens <int> \\
 --data-path <path_to_data> \\
 --min-samples-per-checkpoint <int> \\
 --output-dir <path_to_output> \\
---insert-reasoning-phrases / --no-insert-reasoning-phrases \\
 --infinite-sampler-seed <int> \\
+--samples-per-question <int> \\
 --constant-length-samples <int_or_None> \\
---kl-coeff <float> \\
---num-iterations <int> \\
---num-batches-per-ref-model-update <int> \\
+--dump-samples-filename <str> \\
+--insert-reasoning-phrases / --no-insert-reasoning-phrases \\
+--clip-low <float> \\
+--clip-high <float> \\
+--clip-ratio-c <float> \\
+--num-training-batches <int> \\
+--train-minibatch-size <int> \\
 --logging-level <level> \\
-... # and others, see trainer_core.py main() for full list
+--use-torch-compile / --no-use-torch-compile
 ```
 
 For example, in our recent DeepScaleR reproduction, we used:
@@ -144,7 +146,6 @@ torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py \\
     --num-warmup-steps 5 \\
     --fsdp-sharding-strategy SHARD_GRAD_OP \\
     --max-tokens-per-gpu 80000 \\
-    --loss-chunksize 2048 \\
     --temperature 0.6 \\
     --max-generation-tokens 8192 \\
     --data-path sample-data/deepscaler_r1_qwen1.5b.jsonl \\

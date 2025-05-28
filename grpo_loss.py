@@ -101,10 +101,12 @@ def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', u
         # debug_print(f"\033[1;38;2;255;165;0m _forward line 79: \033[0m mean total_loss: {total_loss.detach().mean()}")
 
         if mode == 'training':
+            # select the GRPO loss function, compile if requested, without shadowing the global
+            loss_fn = grpo_loss_and_entropy_ce_from_logsoftmax
             if use_torch_compile:
-                grpo_loss_and_entropy_ce_from_logsoftmax = torch.compile(grpo_loss_and_entropy_ce_from_logsoftmax)
+                loss_fn = torch.compile(loss_fn)
             
-            out = grpo_loss_and_entropy_ce_from_logsoftmax(
+            out = loss_fn(
                 lm_head_weights=model.lm_head.weight,
                 lm_head_bias=model.lm_head.bias if hasattr(model.lm_head, "bias") else None,
                 hidden_states=hidden_states,
@@ -125,10 +127,12 @@ def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', u
                 loss_clipped=out[5],
             )
         elif mode == 'eval':
+            # select the eval log-prob function, compile if requested
+            loss_fn = ce_loss_and_entropy_logsoftmax
             if use_torch_compile:
-                ce_loss_and_entropy_logsoftmax = torch.compile(ce_loss_and_entropy_logsoftmax)
+                loss_fn = torch.compile(loss_fn)
             
-            out = ce_loss_and_entropy_logsoftmax(
+            out = loss_fn(
                 lm_head_weights=model.lm_head.weight,
                 lm_head_bias=model.lm_head.bias if hasattr(model.lm_head, "bias") else None,
                 hidden_states=hidden_states,
@@ -142,8 +146,8 @@ def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', u
         else:
             raise ValueError(f"Invalid mode: {mode}")
         
-    if use_torch_compile:
-        model.model = torch.compile(model.model)
+    # if use_torch_compile:
+    #     model.model = torch.compile(model.model)
     
     model.__original_forward = model.forward
     model.forward = _forward

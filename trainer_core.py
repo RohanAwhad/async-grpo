@@ -282,11 +282,9 @@ async def train(args,
                     max_reward_in_group=mb["max_reward_in_group"],
                     loss=metrics["loss"],
                     backward_loss=loss.detach().item(),
-                    pg_loss=metrics["pg_loss"],
                     kl_div=metrics["kl_div"],
                     entropy=metrics["entropy"],
                     pg_clip=metrics["pg_clip"],
-                    pg_clip_lower=metrics["pg_clip_lower"],
                     advantage_is_zero=mb["advantage_is_zero"],
                     truncated_sample=mb["truncated_sample"],
                 )
@@ -317,9 +315,7 @@ async def train(args,
                         "avg_loss": bm["loss"] / bm["non_masked_output_tokens"],
                         "lr": lr_scheduler.get_last_lr()[0],
                         "backward_loss": bm["backward_loss"] * int(4000) / bm["non_masked_output_tokens"] / world_size,
-                        "avg_pg_loss": bm["pg_loss"] / bm["non_masked_output_tokens"],
                         "avg_pg_clip": bm["pg_clip"] / bm["non_masked_output_tokens"],
-                        "avg_pg_clip_lower": bm["pg_clip_lower"] / bm["non_masked_output_tokens"],
                         "avg_kl_div": bm["kl_div"] / bm["non_masked_output_tokens"],
                         "avg_modified_reward": bm["modified_reward"] / (bm["modified_samples"] + 1e-6),
                         "num_modified_samples": bm["modified_samples"],
@@ -374,7 +370,6 @@ def main(
     num_warmup_steps: int = Option(10, help="Number of warmup steps for the scheduler."),
     experience_batcher_name: str = Option("experience_batcher", help="Name of the experience batcher actor."),
     max_tokens_per_gpu: int = Option(36000, help="Maximum number of tokens per GPU."),
-    loss_chunksize: int = Option(None, help="Number of tokens to process at a time for the loss computation. This avoids creating the logits matrix all at once in memory. None means no chunking."),
     temperature: float = Option(0.6, help="Sampling temperature for generating experience."),
     max_generation_tokens: int = Option(8192, help="Maximum number of tokens to generate per rollout."),
     insert_reasoning_phrases: bool = Option(False, "--insert-reasoning-phrases/--no-insert-reasoning-phrases", help="Enable rewriting to insert reasoning phrases during inference."),
@@ -411,7 +406,6 @@ def main(
         num_warmup_steps=num_warmup_steps,
         experience_batcher_name=experience_batcher_name,
         max_tokens_per_gpu=max_tokens_per_gpu,
-        loss_chunksize=loss_chunksize,
         temperature=temperature,
         max_generation_tokens=max_generation_tokens,
         insert_reasoning_phrases=insert_reasoning_phrases,
@@ -478,5 +472,5 @@ set -x log_dir /new_data/experiments_rh/phi_mini_2499716_deepscaler_128bs_8spq
 set -x rank 0
 mkdir -p $log_dir
 cd /new_data/aldo/v1_reasoning/grpo_feb_24th/
-set -x NCCL_SOCKET_IFNAME eth1; set -x NCCL_IB_DISABLE 1; set -x CUDA_VISIBLE_DEVICES 4,5,6,7; mamba activate grpo; cd /new_data/aldo/v1_reasoning/grpo_feb_24th/; torchrun   --nnodes=1   --node_rank=(math 1 - 1)   --nproc_per_node=4   --rdzv_id=101   --rdzv_endpoint=10.241.128.19:54367   trainer_core.py     --model-name-or-path         /dev/shm/DeepSeek-R1-Distill-Qwen-1.5B     --learning-rate              125e-8     --batch-size                 128     --lr-scheduler               constant_with_warmup     --num-warmup-steps           10     --fsdp-sharding-strategy     SHARD_GRAD_OP     --max-tokens-per-gpu         80000     --samples-per-question       8     --loss-chunksize             2048     --temperature                0.6     --max-generation-tokens      16000     --data-path                  /new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_r1_qwen1.5b.jsonl     --min-samples-per-checkpoint 30000     --output-dir                 /new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.25e-6_clipping_v1     --infinite-sampler-seed      53     --train-minibatch-size       128     --num-training-batches       1000000     --logging-level              INFO   2>&1 | tee /new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.25e-6_clipping_v1/train_1.log
+set -x NCCL_SOCKET_IFNAME eth1; set -x NCCL_IB_DISABLE 1; set -x CUDA_VISIBLE_DEVICES 4,5,6,7; mamba activate grpo; cd /new_data/aldo/v1_reasoning/grpo_feb_24th/; torchrun   --nnodes=1   --node_rank=(math 1 - 1)   --nproc_per_node=4   --rdzv_id=101   --rdzv_endpoint=10.241.128.19:54367   trainer_core.py     --model-name-or-path         /dev/shm/DeepSeek-R1-Distill-Qwen-1.5B     --learning-rate              125e-8     --batch-size                 128     --lr-scheduler               constant_with_warmup     --num-warmup-steps           10     --fsdp-sharding-strategy     SHARD_GRAD_OP     --max-tokens-per-gpu         80000     --samples-per-question       8     --temperature                0.6     --max-generation-tokens      16000     --data-path                  /new_data/aldo/v1_reasoning/grpo_feb_24th/deepscaler_r1_qwen1.5b.jsonl     --min-samples-per-checkpoint 30000     --output-dir                 /new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.25e-6_clipping_v1     --infinite-sampler-seed      53     --train-minibatch-size       128     --num-training-batches       1000000     --logging-level              INFO   2>&1 | tee /new_data/experiments_rh/deepscaler_r1_qwen1.5b_1.25e-6_clipping_v1/train_1.log
 '''
