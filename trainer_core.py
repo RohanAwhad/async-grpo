@@ -429,6 +429,7 @@ def main(
         train_minibatch_size=train_minibatch_size,
         global_rank=global_rank, # Manually add global_rank
         use_torch_compile=use_torch_compile,
+        mode='training',
     )
     
     # Ensure output directory exists

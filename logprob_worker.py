@@ -39,6 +39,7 @@ class LogprobWorker:
             fsdp_sharding_strategy="FULL_SHARD",
             loss_chunksize=None,
             temperature=temperature,
+            mode='eval',
         )
         self.worker_id = worker_id
         self.max_tokens_per_gpu = max_tokens_per_gpu

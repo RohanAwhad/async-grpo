@@ -5,7 +5,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, g
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
 from utils import log_rank_0
-from grpo_loss import PerTokenLogProbsFromCE, make_grpo_forward
+from grpo_loss import make_grpo_forward, ce_loss_and_entropy_logsoftmax, grpo_loss_and_entropy_ce_from_logsoftmax
 
 def get_module_class_from_name(
     model: torch.nn.Module, name: str
@@ -70,11 +70,11 @@ def setup_model(args, model=None):
     if model is None:
         model = AutoModelForCausalLM.from_pretrained(**base_model_args)
     model = align_model_and_tokenizer(model, tokenizer)
-    model = make_grpo_forward(model, args.loss_chunksize, args.temperature)
-    model.loss_function = PerTokenLogProbsFromCE
-    if getattr(args, 'use_torch_compile', False):
-        torch.compile(model.model)
-        torch.compile(model.loss_function)
+    model.gradient_checkpointing_enable()
+    
+    mode = getattr(args, 'mode', 'eval')
+    temperature = getattr(args, 'temperature', 1.0)
+    model = make_grpo_forward(model, temperature, mode=mode, use_torch_compile=getattr(args, 'use_torch_compile', True))
 
     if model.__class__.__name__ not in [
         "MistralForCausalLM",
@@ -90,7 +90,6 @@ def setup_model(args, model=None):
             to_print=True,
         )
 
-    model.gradient_checkpointing_enable()
     # torch.compile(model)
     return model
 
