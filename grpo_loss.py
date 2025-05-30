@@ -6,6 +6,7 @@ import torch
 torch.set_float32_matmul_precision('high')
 from typing import Callable, Optional, Tuple, Union, List
 import torch.nn as nn
+import torch._dynamo
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
 import torch.nn.functional as F
@@ -16,7 +17,7 @@ def debug_print(message):
         rank = torch.distributed.get_rank()
         with open(f"debug_grpo_loss_{rank}.log", "a") as f:
             f.write(message + "\n")
-    print(message)
+        print(message)
 
 @dataclass
 class GRPOOutput(ModelOutput):
@@ -59,7 +60,9 @@ def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', u
             output_hidden_states if output_hidden_states is not None else model.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else model.config.use_return_dict
-        debug_print(f"\033[1;38;2;255;165;0m _forward line 36: \033[0m input_ids.shape: {input_ids.shape}")
+        
+        if DEBUG:
+            debug_print(f"\033[1;38;2;255;165;0m _forward line 36: \033[0m input_ids.shape: {input_ids.shape}")
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = model.model(
             input_ids=input_ids,
@@ -76,7 +79,8 @@ def make_grpo_forward(model, temperature: float = 1.0, mode: str = 'training', u
         )
         hidden_states = outputs[0]
 
-        debug_print(f"\033[1;38;2;255;165;0m _forward line 53: \033[0m hidden_states.shape: {hidden_states.shape}")
+        if DEBUG:
+            debug_print(f"\033[1;38;2;255;165;0m _forward line 53: \033[0m hidden_states.shape: {hidden_states.shape}")
 
         # T = hidden_states.shape[1]
 
@@ -365,7 +369,7 @@ def fused_log_probs_and_entropy_fn(
     assert labels.shape[0] == 1, "ce_loss_and_entropy only supports batch size 1 but packed"
     shifted_labels = F.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
     V = lm_head_weights.size(0)
-    logits = torch.matmul(hidden_states, lm_head_weights.t())
+    logits = torch.matmul(hidden_states.float(), lm_head_weights.t().float())
     if lm_head_bias is not None:
         logits = logits + lm_head_bias
     logits = logits.float().div_(temperature)
@@ -428,7 +432,7 @@ def grpo_loss_and_entropy_ce_fn(
     mask = shifted_labels.view(-1) != -100
     pg_loss = torch.where(mask, pg_loss, torch.zeros_like(pg_loss))
     pg_loss = pg_loss.sum()
-    return pg_loss, entropy, neg_log_ratio.detach(), loss_clip1.detach(), loss_unclipped.detach(), loss_clipped.detach()
+    return pg_loss, entropy, torch.abs(neg_log_ratio.detach()), loss_clip1.detach(), loss_unclipped.detach(), loss_clipped.detach()
 
 grpo_loss_and_entropy_ce_from_logsoftmax = partial(
     grpo_loss_and_entropy_ce_fn, ce_loss_and_entropy_fn=ce_loss_and_entropy_logsoftmax
@@ -474,7 +478,7 @@ def compute_dual_clip_grpo_loss(
     labels = minibatch["labels"]
 
 
-
+    # torch.distributed.breakpoint()
     grpo_output = policy_model.forward(
         input_ids=batch_ids,
         position_ids=batch_position_ids,
@@ -486,7 +490,8 @@ def compute_dual_clip_grpo_loss(
         clip_high=clip_high,
         clip_ratio_c=clip_ratio_c,
     )
-
+    #### DEBUG #####
+    # old_logprobs.dtype()
 
     # model_out = policy_model(
     #     input_ids=batch_ids,
@@ -544,7 +549,7 @@ def compute_dual_clip_grpo_loss(
     metrics = {
         "loss": grpo_output.loss.detach().item(),
         "pg_clip": (grpo_output.loss_clipped > grpo_output.loss_unclipped).detach()[output_indices].sum().item(),
-        "kl_div": (-grpo_output.neg_log_ratio.detach())[output_indices].sum().item(),
+        "kl_div": grpo_output.neg_log_ratio[output_indices].sum().item(),
         "entropy": grpo_output.entropy[output_indices].sum().item(),
     }
     # metrics = {

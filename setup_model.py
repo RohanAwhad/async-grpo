@@ -64,7 +64,7 @@ def setup_model(args, model=None):
 
     base_model_args = {
         "pretrained_model_name_or_path": args.model_name_or_path,
-        "torch_dtype": torch.bfloat16,
+        "torch_dtype": torch.float32,
     }
     base_model_args["attn_implementation"] = "flash_attention_2"
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -105,10 +105,12 @@ def wrap_fsdp2(model: torch.nn.Module, use_torch_compile: bool = False) -> torch
         raise ValueError(f"Could not find module class named {block_name}")
     # Mixed-precision policy for BF16
     mp_policy = MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        output_dtype=torch.bfloat16,
-        cast_forward_inputs=True,
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+        # reduce_dtype=torch.bfloat16,
+        # output_dtype=torch.bfloat16,
+        cast_forward_inputs=False,
     )
     # FSDP2 settings: full shard, BF16, no CPU offload
     fsdp2_kwargs = {
@@ -122,7 +124,7 @@ def wrap_fsdp2(model: torch.nn.Module, use_torch_compile: bool = False) -> torch
     # Wrap the full model
     fully_shard(model, **fsdp2_kwargs)
     # Cast back to float32
-    model = model.to(torch.float32)
+    # model = model.to(torch.float32)
     if use_torch_compile:
         model = torch.compile(model)
     return model

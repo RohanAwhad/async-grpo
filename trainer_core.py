@@ -16,7 +16,7 @@ from typer import Typer, Option
 
 from setup_model import setup_model, setup_training_components
 from grpo_loss import compute_dual_clip_grpo_loss
-from utils import init_distributed_environment, log_rank_0, setup_logger, ArgsNamespace
+from utils import get_fsdp_param_l1_stats, init_distributed_environment, log_rank_0, setup_logger, ArgsNamespace
 from sample_processing_utils import post_process_batch
 from batch_metrics import BatchMetrics
 from file_writer_actor import get_or_create_filewriter
@@ -179,6 +179,8 @@ def take_gradient_step(model, optimizer, lr_scheduler):
     """Scales gradients, applies clipping, and takes an optimization step."""
     rank = torch.distributed.get_rank()
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    torch.distributed.barrier()
+    grad_norm = grad_norm.full_tensor()
     print(f"\033[1;38;2;255;165;0mGlobal Grad Norm:\033[0m {grad_norm} \033[1;38;2;255;165;0mRank:\033[0m {rank}")
     optimizer.step()
     lr_scheduler.step()
@@ -217,6 +219,8 @@ async def train(args,
     total_samples_accumulated = 0
     last_saved_samples = 0
     batch_totals = BatchMetrics()
+
+    get_fsdp_param_l1_stats(policy_model, initialize_baseline=True)
     
     # Outermost loop: Policy iteration
     for iteration in range(args.num_training_batches):
@@ -242,7 +246,7 @@ async def train(args,
 
         event_start_time = time.time()
         # Count of microbatches processed in this policy iteration
-        num_microbatches = 0
+        num_microbatches_in_minibatch = 0
         total_non_masked_tokens = 0
         async for msg in remote_event_generator(
             args.global_rank,
@@ -288,8 +292,8 @@ async def train(args,
                     advantage_is_zero=mb["advantage_is_zero"],
                     truncated_sample=mb["truncated_sample"],
                 )
-                num_microbatches += 1
-                print(f"\033[1;38;2;255;165;0mNum microbatches:\033[0m {num_microbatches} \033[1;38;2;255;165;0mRank:\033[0m {rank}")
+                num_microbatches_in_minibatch += 1
+                print(f"\033[1;38;2;255;165;0mNum microbatches in minibatch:\033[0m {num_microbatches_in_minibatch} \033[1;38;2;255;165;0mRank:\033[0m {rank}")
             elif msg.type is MessageType.GRADIENT_STEP:
                 # reduce metrics, take gradient step
                 batch_totals.reduce_batch_metrics(device)
@@ -299,6 +303,9 @@ async def train(args,
                 grad_norm = take_gradient_step(
                     policy_model, optimizer, lr_scheduler,
                 )
+
+                model_norm, model_delta_norm, update_ratio_min, update_ratio_p25, update_ratio_p50, update_ratio_p75, update_ratio_max = get_fsdp_param_l1_stats(policy_model)
+
                 if is_main_process:
                     # compute timing since event start
                     batch_time = time.time() - event_start_time
@@ -312,9 +319,9 @@ async def train(args,
                         "avg_output_tokens": bm["output_tokens"] / bm["samples"],
                         "total_non_masked_tokens": total_non_masked_tokens,
                         "num_non_masked_tokens": bm["non_masked_output_tokens"],
-                        "avg_loss": bm["loss"] / bm["non_masked_output_tokens"],
+                        "avg_loss": bm["loss"] / world_size / num_microbatches_in_minibatch,
                         "lr": lr_scheduler.get_last_lr()[0],
-                        "backward_loss": bm["backward_loss"] * int(4000) / bm["non_masked_output_tokens"] / world_size,
+                        "backward_loss": bm["backward_loss"]/world_size/num_microbatches_in_minibatch,
                         "avg_pg_clip": bm["pg_clip"] / bm["non_masked_output_tokens"],
                         "avg_kl_div": bm["kl_div"] / bm["non_masked_output_tokens"],
                         "avg_modified_reward": bm["modified_reward"] / (bm["modified_samples"] + 1e-6),
@@ -329,12 +336,20 @@ async def train(args,
                         "samples_per_second": bm["samples"] / batch_time,
                         "peak_memory_usage_GB": float(torch.cuda.max_memory_allocated() / 1e9),
                         "entropy": bm["entropy"] / bm["output_tokens"],
-                        "batch_done": msg.type is MessageType.BATCH_DONE,
+                        "batch_done": total_samples_accumulated % (args.batch_size * args.samples_per_question) == 0,
+                        "model_norm": model_norm,
+                        "model_delta_norm": model_delta_norm,
+                        "update_ratio_min": update_ratio_min,
+                        "update_ratio_p25": update_ratio_p25,
+                        "update_ratio_p50": update_ratio_p50,
+                        "update_ratio_p75": update_ratio_p75,
+                        "update_ratio_max": update_ratio_max,
                     }
                     if metric_logger:
                         metric_logger.append.remote(metrics_to_log, timestamp=True, print_console=True)
                     batch_totals.reset_batch()
                     torch.cuda.empty_cache()
+                    num_microbatches_in_minibatch = 0
 
             elif msg.type is MessageType.BATCH_DONE:
                 print(f"\033[1;38;2;255;165;0mBatch Done:\033[0m {total_samples_accumulated} \033[1;38;2;255;165;0mRank:\033[0m {rank}")
