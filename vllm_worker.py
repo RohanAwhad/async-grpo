@@ -21,6 +21,7 @@ from transformers import AutoTokenizer
 
 from vllm_registry import get_or_create_registry 
 from verifier_pool import get_or_create_verifier_pool
+from reward_registry import RewardType
 
 
 import numpy as np
@@ -196,9 +197,11 @@ class BaseVLLMWorker:
 @ray.remote
 class GenerationVLLMWorker(BaseVLLMWorker):
     def __init__(self, model_path: str, worker_id: str, tensor_parallel_size: int, max_num_seqs: int,
-                 global_num_verifiers: int = 4, write_failed: bool = False, overhead_seqs: int = 8, enable_prefix_caching: bool = True):
-        # Pass the common parameters to the base initializer.
-        self.verifier_pool = get_or_create_verifier_pool(global_num_verifiers, write_failed)
+                 global_num_verifiers: int = 4, write_failed: bool = False, overhead_seqs: int = 8, enable_prefix_caching: bool = True,
+                 reward_fns: list[RewardType] = [RewardType.MATHD, RewardType.SYMPY]):
+        reward_enum_list = [RewardType(fn) for fn in reward_fns]
+        # Initialize verifier pool with selected reward functions
+        self.verifier_pool = get_or_create_verifier_pool(global_num_verifiers, write_failed, reward_enum_list)
         self.enable_prefix_caching = enable_prefix_caching
         super().__init__(model_path, worker_id, tensor_parallel_size, max_num_seqs, overhead_seqs)
     
@@ -266,7 +269,7 @@ class GenerationVLLMWorker(BaseVLLMWorker):
             sample['num_non_masked_output_tokens'] = sum(1 for label in labels if label != -100)
             # Use the remote call because verifier_pool is now a ray actor
             sample_rewards_futures.append(
-                self.verifier_pool.verify_balanced.remote(
+                self.verifier_pool.verify.remote(
                     sample,
                     max_gen_length=kwargs.get("max_tokens", self.engine_args.max_model_len)
                 )
@@ -300,7 +303,7 @@ class GenerationVLLMWorker(BaseVLLMWorker):
                         labels[pos] = modified_sample['sample_ids'][pos]
                 modified_sample['labels'] = labels
                 modified_rewards_futures.append(
-                    self.verifier_pool.verify_balanced.remote(
+                    self.verifier_pool.verify.remote(
                         modified_sample,
                         max_gen_length=kwargs.get("max_tokens", self.engine_args.max_model_len)
                     )
@@ -337,6 +340,7 @@ if __name__ == "__main__":
     parser.add_argument("--write_failed", action="store_true", help="Write failed generation samples to file")
     parser.add_argument("--overhead_seqs", type=int, default=8, help="Number of extra sequences to send over the limit")
     parser.add_argument("--enable_prefix_caching", type=lambda x: x.lower()=="true", default=True, help="Enable prefix caching for the generation worker")
+    parser.add_argument("--reward_fns", type=str, default="", help="Comma-separated reward function names (mathd,sympy,countdown)")
     args = parser.parse_args()
 
     # Prepare runtime_env for the worker (as seen in worker_dispatcher.py)
@@ -350,6 +354,8 @@ if __name__ == "__main__":
     ]
     runtime_env["excludes"] = ["*.pyc", "__pycache__"]
 
+    # Prepare reward_fns list
+    reward_fns_list = args.reward_fns.split(',') if args.reward_fns else []
     # Spawn the GenerationVLLMWorker actor with dispatcher-style options
     service_id = f"generation_worker_{uuid.uuid4()}"
     worker = GenerationVLLMWorker.options(
@@ -366,7 +372,8 @@ if __name__ == "__main__":
         global_num_verifiers=args.num_verifiers,
         write_failed=args.write_failed,
         overhead_seqs=args.overhead_seqs,
-        enable_prefix_caching=args.enable_prefix_caching
+        enable_prefix_caching=args.enable_prefix_caching,
+        reward_fns=reward_fns_list
     )
 
     registry_name = "generation_vllm_registry"

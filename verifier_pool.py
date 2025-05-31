@@ -12,9 +12,9 @@ from functools import partial
 import ray
 from filelock import FileLock, Timeout
 from wrapt_timeout_decorator import timeout
-from deepscaler_math_utils import extract_answer, grade_answer_mathd, grade_answer_sympy
 from utils import patch_target_module
 from functools import partial
+from reward_registry import get_reward_adapter, RewardType
 patch_target_module("math_verify.utils.timeout", partial(timeout, use_signals=False))
 
 import numpy as np
@@ -63,55 +63,25 @@ class VerifierWorker:
         self.worker_id = worker_id
         print(f"Initializing VerifierWorker with id: {worker_id}")
 
-    def extract_reference_and_answer(self, sample: dict):
-        original_input = sample['input']
-        output = sample['sample_text'].split(original_input)[1]
-        if "\\boxed" in sample['answer']:
-            sample['parsed_gt_answer'] = extract_answer(sample['answer'])
-        else:
-            sample['parsed_gt_answer'] = sample['answer']
-        try:
-            sample['parsed_attempt'] = extract_answer(output)
-        except Exception:
-            sample['parsed_attempt'] = ''
-        return sample
-    
-    def verify_both(self, sample: dict, max_gen_length: int):
-        sample = self.extract_reference_and_answer(sample)
-        sample['original_reward'] = grade_answer_mathd(sample['parsed_attempt'], sample['parsed_gt_answer']) or grade_answer_sympy(sample['parsed_attempt'], sample['parsed_gt_answer'])
-        # TODO: Add cosine reward
-        sample['reward'] = sample['original_reward']
-        return sample
-    
-    def verify_mathd(self, sample: dict, max_gen_length: int):
-        sample = self.extract_reference_and_answer(sample)
-        sample['original_reward'] = grade_answer_mathd(sample['parsed_attempt'], sample['parsed_gt_answer'])
-        sample['reward'] = sample['original_reward']
-        # sample['reward'] = compute_cosine_reward(sample['output_len'], 
-        #                                          max_gen_length, 
-        #                                          format_quality=sample['parsed_attempt'] != '', 
-        #                                          is_correct=sample['original_reward'])
-        return sample
-    
-    def verify_sympy(self, sample: dict, max_gen_length: int):
-        sample = self.extract_reference_and_answer(sample)
-        sample['original_reward'] = grade_answer_sympy(sample['parsed_attempt'], sample['parsed_gt_answer'])
-        sample['reward'] = sample['original_reward']
-        # sample['reward'] = compute_cosine_reward(sample['output_len'], 
-        #                                          max_gen_length, 
-        #                                          format_quality=sample['parsed_attempt'] != '', 
-        #                                          is_correct=sample['original_reward'])
+    def verify_task(self, sample: dict, reward_fn_name: str, **kwargs) -> dict:
+        """Generic verification entry point that applies the named reward adapter."""
+        adapter = get_reward_adapter(reward_fn_name)
+        out = adapter(sample, **kwargs)
+        sample.update(**out)
+        sample['reward_success'] = True
         return sample
 
 @ray.remote
 class VerifierPool:
-    def __init__(self, global_num_verifiers: int, write_failed: bool = False, output_dir: str = None):
+    def __init__(self, global_num_verifiers: int, write_failed: bool = False, reward_fns: list[RewardType] = None, output_dir: str = None):
         self.node_id = ray.get_runtime_context().get_node_id()
         self.global_num_verifiers = global_num_verifiers
         self.write_failed = write_failed
         self.lock = asyncio.Lock()
         # Create an asyncio.Queue to hold available workers.
         self.verifier_queue = asyncio.Queue()
+        # Default to both mathd and sympy if not provided
+        self.reward_fns = reward_fns or [RewardType.MATHD, RewardType.SYMPY]
         for _ in range(global_num_verifiers):
             self.create_verifier_worker()
         self.outfile = Path(output_dir) / "failed_samples_verify.jsonl" if output_dir is not None else Path("failed_samples_verify.jsonl")
@@ -139,59 +109,50 @@ class VerifierPool:
         return sample
     
     async def _verify_single(self, sample: dict, mode: str, **kwargs) -> dict:
-        # Get a worker from the queue. If none available, create one.
+        # Acquire a worker
         worker = await self.verifier_queue.get()
         try:
-            # Dynamically call the required verification method.
-            method = getattr(worker, f"verify_{mode}")
-            result_ref = method.remote(sample, kwargs['max_gen_length'])
+            # Dispatch to worker
+            result_ref = worker.verify_task.remote(sample, mode, **kwargs)
             result = await asyncio.wait_for(result_ref, 30)
-        except Exception as e:
-            # Replace the worker on failure.
+            # Return worker to pool
+            self.verifier_queue.put_nowait(worker)
+            return result
+        except Exception:
+            # Worker failed: kill and replace
             ray.kill(worker)
             self.create_verifier_worker()
-            # import traceback
-            # traceback.print_exc()
-            raise e
-        self.verifier_queue.put_nowait(worker)
-        return result
+            # Return a default failure sample
+            sample['reward'] = 0.0
+            sample['reward_success'] = False
+            return sample
     
     async def pick_verified_sample(self, results: list[dict]) -> dict:
-        # Choose the result with the highest reward or non '' parsed_attempt
-        for result in results:
-            if result['original_reward'] > 0:
-                return result
-        for result in results:
-            if result['parsed_attempt'] != '':
-                return result
-        return results[0]
+        """Pick the best result by prioritizing reward, then success flag."""
+        return max(
+            results,
+            key=lambda r: (
+                r.get('reward', 0),
+                r.get('reward_success', False),
+            ),
+        )
 
-    async def verify_balanced(self, sample: dict, **kwargs) -> dict:
-        # Run both mathd and sympy verification tasks concurrently
-        sample['original_reward'] = 0.0
-        sample['reward'] = 0.0
-        sample['parsed_attempt'] = ''
+    async def verify(self, sample: dict, **kwargs) -> dict:
+        """Verify using the configured reward functions list."""
         tasks = [
-            asyncio.create_task(self._verify_single(deepcopy(sample), 'mathd', **kwargs)),
-            asyncio.create_task(self._verify_single(deepcopy(sample), 'sympy', **kwargs))
+            asyncio.create_task(
+                self._verify_single(deepcopy(sample), fn, **kwargs)
+            ) for fn in self.reward_fns
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        valid_results = []
-        for res in results:
-            if isinstance(res, Exception):
-                continue
-            valid_results.append(res)
-        if not valid_results:
+        results = await asyncio.gather(*tasks)
+        if not any(r.get('reward_success', False) for r in results):
             await self.write_failed_sample(sample)
-            return sample
-        
-        return await self.pick_verified_sample(valid_results)
+        return await self.pick_verified_sample(results)
 
 
-def get_or_create_verifier_pool(global_num_verifiers: int, write_failed: bool = False) -> VerifierPool:
+def get_or_create_verifier_pool(global_num_verifiers: int, write_failed: bool = False, reward_fns: list[RewardType] = None, output_dir: str = None) -> VerifierPool:
     # For simplicity, always create a new instance. In a production setting, you might want to implement a singleton.
     try:
-        return VerifierPool.options(name="verifier_pool").remote(global_num_verifiers, write_failed) 
+        return VerifierPool.options(name="verifier_pool").remote(global_num_verifiers, write_failed, reward_fns, output_dir)
     except Exception as e:
         return ray.get_actor("verifier_pool")

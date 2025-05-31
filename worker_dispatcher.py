@@ -14,7 +14,10 @@ import ray
 
 from verifier_pool import get_or_create_verifier_pool
 from vllm_registry import get_or_create_registry
+from reward_registry import RewardType
 
+# Comma-separated string of available reward types
+_AVAILABLE_REWARD_TYPES = ", ".join([rt.value for rt in RewardType])
 
 def get_runtime_env(mode: str):
     runtime_env = {"env_vars": dict(os.environ)}
@@ -33,7 +36,8 @@ def get_runtime_env(mode: str):
 def create_worker(mode: str, model_path: str, tensor_parallel_size: int=1, max_num_seqs: int=1,
                     global_num_verifiers: int = 100, max_tokens_per_gpu: int = 23000,
                     write_failed_generation_samples: bool = False, overhead_seqs: int = 8,
-                    enable_prefix_caching: bool = True, temperature: float = 1.0):
+                    enable_prefix_caching: bool = True, temperature: float = 1.0,
+                    reward_fns: list[RewardType] = None):
     """
     Instantiate the appropriate worker on the remote process after the runtime environment
     is set up. This defers the import of worker-specific modules to the worker process.
@@ -54,7 +58,8 @@ def create_worker(mode: str, model_path: str, tensor_parallel_size: int=1, max_n
             global_num_verifiers=global_num_verifiers,
             write_failed=write_failed_generation_samples,
             overhead_seqs=overhead_seqs,
-            enable_prefix_caching=enable_prefix_caching
+            enable_prefix_caching=enable_prefix_caching,
+            reward_fns=reward_fns
         )
     elif mode == "logprob":
         from logprob_worker import LogprobWorker  # lazy import on remote worker
@@ -99,6 +104,12 @@ if __name__ == "__main__":
                         help="Toggle prefix caching for generation worker (True/False)")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Temperature for logprob worker")
+    parser.add_argument(
+        "--reward_fns",
+        type=str,
+        default="",
+        help=f"Comma-separated reward functions. Available: {_AVAILABLE_REWARD_TYPES}",
+    )
     args = parser.parse_args()
 
     # Initialize Ray.
@@ -127,6 +138,7 @@ if __name__ == "__main__":
         overhead_seqs=args.overhead_seqs,
         enable_prefix_caching=args.enable_prefix_caching,
         temperature=args.temperature,
+        reward_fns=args.reward_fns.split(',') if args.reward_fns else None
     ))
 
     print(f"Worker {worker} created.")
