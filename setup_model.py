@@ -64,7 +64,7 @@ def setup_model(args, model=None):
 
     base_model_args = {
         "pretrained_model_name_or_path": args.model_name_or_path,
-        "torch_dtype": torch.float32,
+        "torch_dtype": torch.bfloat16,
     }
     base_model_args["attn_implementation"] = "flash_attention_2"
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -124,7 +124,7 @@ def wrap_fsdp2(model: torch.nn.Module, use_torch_compile: bool = False) -> torch
     # Wrap the full model
     fully_shard(model, **fsdp2_kwargs)
     # Cast back to float32
-    # model = model.to(torch.float32)
+    model = model.to(torch.float32)
     if use_torch_compile:
         model = torch.compile(model)
     return model
