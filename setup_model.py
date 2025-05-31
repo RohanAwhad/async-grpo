@@ -105,7 +105,7 @@ def wrap_fsdp2(model: torch.nn.Module, use_torch_compile: bool = False) -> torch
         raise ValueError(f"Could not find module class named {block_name}")
     # Mixed-precision policy for BF16
     mp_policy = MixedPrecisionPolicy(
-        param_dtype=torch.float32,
+        param_dtype=torch.bfloat16,
         reduce_dtype=torch.float32,
         output_dtype=torch.float32,
         # reduce_dtype=torch.bfloat16,
