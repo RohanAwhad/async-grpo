@@ -210,13 +210,35 @@ We expect passed-in data to be in a JSONL format, with two required fields:
  - `answer`: The ground truth answer to be compared against in the reward function / verifier. Note that this field name is only strictly necessary when using our default verifier. A custom verifier could also reference any custom field name.
 
 ### Custom Reward Functions
-To add your own custom verifiers or reward calculations, everything is currently self-contained in `verifier_pool.py`. Specifically, in [vllm_worker.py](https://github.com/Red-Hat-AI-Innovation-Team/async-grpo/blob/ff89a64d141d6e6e0eabeb524a030138713b759c/vllm_worker.py#L260), you can see the function `verify_balanced` is being called with an input of a sample dict (input, output, gt answer, and any other fields included in the original data) to get the updated sample with calculated reward.
+Async-GRPO now supports fully pluggable reward adapters via `reward_registry.py` and the `RewardType` enum. No core code changes are needed to introduce new reward logic.
 
-To add your own reward function, you will essentially need to modify two things:
- - Add a new verifier(s) function to the `VerifierWorker` object.
- - Adjust the `verify_balanced` function in the `VerifierPool` to call the new verifier(s).
+1. Implement your adapter function in `reward_registry.py`:
+   ```python
+   def my_custom_adapter(sample: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+       """Compute and return at least {'reward': float}, optionally 'format_reward'."""
+       # e.g., sample processing...
+       reward_value = ...
+       format_value = ...  # optional
+       return { 'reward': reward_value, 'format_reward': format_value }
+   ```
 
-Any number of verifiers can be added and called, as long as the final reward is updated for the returned sample.
+2. Register it under a new enum member:
+   ```python
+   class RewardType(str, Enum):
+       MATHD = "mathd"
+       SYMPY = "sympy"
+       COUNTDOWN = "countdown"
+       MY_CUSTOM = "my_custom"
+   
+   REWARD_ADAPTERS[RewardType.MY_CUSTOM] = my_custom_adapter
+   ```
+
+3. Launch inference or generation workers with the desired adapters:
+   ```bash
+   python worker_dispatcher.py --mode generation --reward_fns mathd,my_custom
+   ```
+
+The `VerifierPool` will spawn one Ray worker per adapter, run them in parallel on each sample, and select the best result (highest `reward` or any successful computation). This makes it trivial to mix and match or extend reward functions without touching the pool or worker logic.
 
 # Architecture Explanation
 
