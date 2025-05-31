@@ -118,8 +118,10 @@ class VerifierPool:
             # Return worker to pool
             self.verifier_queue.put_nowait(worker)
             return result
-        except Exception:
+        except Exception as e:
             # Worker failed: kill and replace
+            import traceback
+            traceback.print_exc()
             ray.kill(worker)
             self.create_verifier_worker()
             # Return a default failure sample
