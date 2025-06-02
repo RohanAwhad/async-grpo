@@ -119,14 +119,15 @@ if __name__ == "__main__":
 
     verifier_pool = None
     if args.mode == "generation":
-        verifier_pool = get_or_create_verifier_pool(args.global_num_verifiers)
+        reward_enum_list = [RewardType(fn) for fn in args.reward_fns.split(',')]
+        verifier_pool = get_or_create_verifier_pool(args.global_num_verifiers, args.write_failed_generation_samples, reward_enum_list, output_dir=None)
 
     print(f"Launching {args.mode} worker ...")
     
-    runtime_env = get_runtime_env(args.mode)
+    
     # Create the remote factory with the proper runtime_env so that its remote methods
     # execute in the customized environment.
-    # factory = WorkerFactory.options(runtime_env=runtime_env).remote()
+    runtime_env = get_runtime_env(args.mode)
     worker = ray.get(create_worker.options(runtime_env=runtime_env).remote(
         mode=args.mode,
         model_path=args.model_path,
