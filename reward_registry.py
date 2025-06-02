@@ -64,17 +64,12 @@ def countdown_adapter(sample: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     RESPONSE_PROMPT = "Let me solve this step by step.\n<think>"
     # Isolate model's generated text by splitting off the prompt
     full_text = sample.get('sample_text', '')
-    prompt = sample.get('input', '')
-    if prompt and prompt in full_text:
-        output = full_text.split(prompt, 1)[1]
-    else:
-        output = full_text
+    output = full_text.split(sample.get('input', ''), 1)[1]
+    response = "<think>" + output
     # Prepend the RESPONSE_PROMPT to reconstruct the opening <think> tag
-    response = RESPONSE_PROMPT + output
-    format_r = format_reward_function(response)
+    format_r = format_reward_function(response, end_token=sample.get('end_token', ''))
     answer_r = answer_reward_function(response, numbers=sample.get('nums'), target=sample.get('target'))
     reward = format_r * 0.1 + answer_r
-    success = True
     return {"reward": reward, "format_reward": format_r}
 
 

@@ -110,7 +110,7 @@ def wrap_fsdp2(model: torch.nn.Module, use_torch_compile: bool = False) -> torch
         output_dtype=torch.float32,
         # reduce_dtype=torch.bfloat16,
         # output_dtype=torch.bfloat16,
-        cast_forward_inputs=False,
+        cast_forward_inputs=True,
     )
     # FSDP2 settings: full shard, BF16, no CPU offload
     fsdp2_kwargs = {

@@ -121,7 +121,7 @@ class VerifierPool:
         except Exception as e:
             # Worker failed: kill and replace
             import traceback
-            traceback.print_exc()
+            print(traceback.format_exc())
             ray.kill(worker)
             self.create_verifier_worker()
             # Return a default failure sample
@@ -147,6 +147,7 @@ class VerifierPool:
             ) for fn in self.reward_fns
         ]
         results = await asyncio.gather(*tasks)
+        print(f'\033[38;5;196m\033[1m DEBUG: Results: {results[0]["reward"]}\033[0m', flush=True)
         if not any(r.get('reward_success', False) for r in results):
             await self.write_failed_sample(sample)
         return await self.pick_verified_sample(results)
@@ -158,3 +159,27 @@ def get_or_create_verifier_pool(global_num_verifiers: int, write_failed: bool = 
         return VerifierPool.options(name="verifier_pool").remote(global_num_verifiers, write_failed, reward_fns, output_dir)
     except Exception as e:
         return ray.get_actor("verifier_pool")
+    
+if __name__ == '__main__':
+    import ray
+    from reward_registry import RewardType
+    from verifier_pool import get_or_create_verifier_pool
+
+    # Initialize Ray
+    ray.init(address="auto", namespace="test")
+
+    # Create a verifier pool with one worker
+    pool = get_or_create_verifier_pool(global_num_verifiers=1, write_failed=True, reward_fns=[RewardType.COUNTDOWN], output_dir=None)
+
+    # Define a sample for countdown task
+    with open("/new_data/experiments_rh/countdown_grpo_qwen3b/sample.json", "r") as f:
+        sample = json.load(f)
+    sample['sample_text'] = "<|im_start|>system\nYou are a helpful assistant. You first think about the reasoning process in your mind and then provide the user with the answer.<|im_end|>\n<|im_start|>user\nUsing the numbers [91, 65, 3], create an equation that equals 23. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>.<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think> We need to use the numbers 91, 65, and 3 only once to form an equation that equals 23. One way to approach this is to consider the operations and their effects on the numbers. The number 91 is quite large and 65 is also quite large, so subtracting or dividing might not be the best approach. The number 3 seems more manageable. A possible strategy is to think of a way to reduce the value of 91 and 65 to 23 using basic arithmetic. One way to do this is by combining them in a specific way after applying an operation to one of them. </think>\n<answer> (91 - 65) - 3 </answer><|im_end|>"
+    sample['end_token'] = "<|im_end|>"
+
+    # Invoke the countdown reward adapter via the verifier pool
+    result = ray.get(pool.verify.remote(sample))
+
+    # print('Debugger result:', result)
+    from IPython import embed; embed()
+    
