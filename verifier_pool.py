@@ -87,6 +87,7 @@ class VerifierPool:
         self.outfile = Path(output_dir) / "failed_samples_verify.jsonl" if output_dir is not None else Path("failed_samples_verify.jsonl")
         self.outfile.unlink(missing_ok=True)
         Path(str(self.outfile) + '.lock').unlink(missing_ok=True)
+        print(f"\033[38;5;196m\033[1m DEBUG: VerifierPool reward_fns: {self.reward_fns}\033[0m", flush=True)
         
     def create_verifier_worker(self):
         # Create a new worker instance.
@@ -147,7 +148,7 @@ class VerifierPool:
             ) for fn in self.reward_fns
         ]
         results = await asyncio.gather(*tasks)
-        print(f'\033[38;5;196m\033[1m DEBUG: Results: {results[0]["reward"]}\033[0m', flush=True)
+        # print(f'\033[38;5;196m\033[1m DEBUG: Results: {results[0]["reward"]}\033[0m', flush=True)
         if not any(r.get('reward_success', False) for r in results):
             await self.write_failed_sample(sample)
         return await self.pick_verified_sample(results)
