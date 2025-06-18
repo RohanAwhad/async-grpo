@@ -47,23 +47,20 @@ The codebase is designed to be extremely modular and easy to hack, handling work
 
 On all nodes being used for any component in the run, begin with the following setup:
 ```bash
-conda create -n base python=3.12 -y
-conda activate base
+conda create -n grpo_base python=3.12 -y
+conda activate grpo_base
 pip install -r requirements_base.txt
 ```
 
 Next, start a ray cluster across the nodes. On the head node, run:
 ```bash
 ray start --head \
---resources='{"verification_slot":100}' \
---port=6379 \
---object-manager-port=8076 \
---temp-dir=/dev/shm/ray
+--port 6379 
 ```
 
 and then on each additional node, run:
 ```bash
-conda activate base
+conda activate grpo_base
 ray start --address=head_node_ip:6379
 ```
 
@@ -74,87 +71,97 @@ ray start --address=head_node_ip:6379
 Once the Ray cluster has been set up, the next step is to spin up the inference workers (this includes both the vLLM rollout workers and the reference logprob workers). On each node being used for inference, launch inference workers on the desired GPUs. 
 
 For example, for a node with 8 GPUs, and using 7 for generation and 1 for logprob, you would do the following:
+
+##### VLLM inference workers
+
+**NOTE:** do this on each node you want to use for inference.
+
 ```bash
-for i in (seq 0 7)
-    if test $i -lt 7
-        echo "Launching generation worker on GPU $i..."
-        python worker_dispatcher.py \
-            --model_path /dev/shm/qwen7b-math-base \
-            --mode generation \
-            --tensor_parallel_size 1 \
-            --max_num_seqs 128 \
-            --write_failed_generation_samples \
-            --global_num_verifiers 50 | tee generation_worker_$i.log &
-    else
-        echo "Launching logprob worker on GPU $i..."
-        torchrun --nproc_per_node=1 --master_port=1234$i worker_dispatcher.py \
-            --model_path /dev/shm/qwen7b-math-base \
-            --mode logprob \
-            --max_tokens_per_gpu 30000 2>&1 | tee logprob_worker_$i.log &
-    end
-end
+export num_inference_workers_in_node=1
+export vllm_max_num_seqs=64
+export vllm_overhead_seqs=16
+export reward_fns=countdown
+export base_model_path=Qwen/Qwen2-1.5B-Instruct
+
+for i in $(seq 0 $num_inference_workers_in_node); do
+  python worker_dispatcher.py \
+    --model_path "$base_model_path" \
+    --mode generation \
+    --tensor_parallel_size 1 \
+    --max_num_seqs "$vllm_max_num_seqs" \
+    --overhead_seqs "$vllm_overhead_seqs" \
+    --write_failed_generation_samples \
+    --reward_fns "$reward_fns" \
+    --global_num_verifiers 50 2>&1 | tee ~/grpo_vllm_"$i".log
+done
+```
+
+##### Logprob inference workers
+
+**NOTE:** do this on each node you want to use for logprob inference.
+
+```bash
+export num_workers=1
+export base_model_path=Qwen/Qwen2-1.5B-Instruct
+export temperature=1.0
+export logprob_max_tokens_per_gpu=100000
+
+for i in $(seq 1 $num_workers); do
+torchrun --nproc_per_node=1 --master_port=1234$i worker_dispatcher.py \
+--model_path $base_model_path \
+--mode logprob \
+--temperature $temperature \
+--max_tokens_per_gpu $logprob_max_tokens_per_gpu 2>&1 | tee ~/grpo_logprob_$i.log
+done
 ```
 
 In our test, we used two nodes, a total of 16 GPUs, 14 for generation and 2 for logprob. you must wait until all the workers are started before starting the training, which is shown by `worker <ID> registered` for each worker. Adjust the number of verifiers, each uses one CPU, make sure your cluster has the capacity.
+
+### Prepare the dataset
+this is custom for the task you're training on. In our case, we used the [Countdown-Tasks-3to4](https://huggingface.co/datasets/Jiayi-Pan/Countdown-Tasks-3to4) dataset. Which we process doing the following:
+
+```bash
+python sample-data/create_count_down.py
+```
+
+this will create a file called `count_down_tasks_3to4.jsonl` in the `sample-data` directory.
 
 ### Start the training on the nodes you want to use for training
 
 Finally, the last step is to launch the training on the remaining GPUs. In this example case, we trained with 8 GPUs on a single training node.
 
 ```bash
-conda create grpo python=3.12 -y; conda activate grpo; pip install -r requirements_fsdp.txt; pip install -r requirements_base.txt
-torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py --output-dir /path/to/output/dir --min-samples-per-checkpoint 30000 [OTHER_OPTIONS...] 2>&1 | tee train.log
-```
-
-Hyperparameters can be passed as arguments or adjusted directly in `trainer_core.py`:
-```bash
---model-name-or-path <path_or_id> \\
---learning-rate <float> \\
---batch-size <int> \\
---lr-scheduler <scheduler_name> \\
---num-warmup-steps <int> \\
---experience-batcher-name <str> \\
---max-tokens-per-gpu <int> \\
---temperature <float> \\
---max-generation-tokens <int> \\
---data-path <path_to_data> \\
---min-samples-per-checkpoint <int> \\
---output-dir <path_to_output> \\
---infinite-sampler-seed <int> \\
---samples-per-question <int> \\
---constant-length-samples <int_or_None> \\
---dump-samples-filename <str> \\
---insert-reasoning-phrases / --no-insert-reasoning-phrases \\
---clip-low <float> \\
---clip-high <float> \\
---clip-ratio-c <float> \\
---num-training-batches <int> \\
---train-minibatch-size <int> \\
---logging-level <level> \\
---use-torch-compile / --no-use-torch-compile
+conda create grpo python=3.12 -y; conda activate grpo; pip install -r requirements_base.txt;pip install -r requirements_fsdp.txt
 ```
 
 For example, in our recent DeepScaleR reproduction, we used:
 ```bash
-torchrun --nproc_per_node=8 --master_port=12345 trainer_core.py \\
-    --model-name-or-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
-    --learning-rate 2e-6 \\
-    --batch-size 128 \\
-    --samples-per-question 8 \\
-    --infinite-sampler-seed 223 \\
-    --lr-scheduler constant_with_warmup \\
-    --num-warmup-steps 5 \\
-    --fsdp-sharding-strategy SHARD_GRAD_OP \\
-    --max-tokens-per-gpu 80000 \\
-    --temperature 0.6 \\
-    --max-generation-tokens 8192 \\
-    --data-path sample-data/deepscaler_r1_qwen1.5b.jsonl \\
-    --min-samples-per-checkpoint 30000 \\
-    --output-dir /path/to/your/output/directory \\
-    --num-batches-per-ref-model-update 40 \\
-    --kl-coeff 0.001 \\
-    --num-iterations 1000000 \\
-    2>&1 | tee train_deepscaler_repro.log
+CUDA_VISIBLE_DEVICES=2,3 torchrun \
+  --nnodes=1 \
+  --node_rank=0 \
+  --nproc_per_node=2 \
+  --rdzv_id=101 \
+  --rdzv_endpoint=localhost:54367 \
+  trainer_core.py \
+    --model-name-or-path         Qwen/Qwen2-1.5B-Instruct \
+    --learning-rate              2e-6 \
+    --batch-size                 128 \
+    --lr-scheduler              constant_with_warmup \
+    --num-warmup-steps           5 \
+    --max-tokens-per-gpu         30000 \
+    --samples-per-question       32 \
+    --temperature                1.0 \
+    --max-generation-tokens      16384 \
+    --data-path                  sample-data/count_down_tasks_3to4.jsonl \
+    --min-samples-per-checkpoint 20000 \
+    --output-dir                 dummy_output/ \
+    --dump-samples-filename      dummy_output/dump_samples.jsonl \
+    --infinite-sampler-seed      223 \
+    --train-minibatch-size       32 \
+    --num-training-batches       1000000 \
+    --logging-level              INFO \
+    --use-torch-compile \
+  2>&1 | tee train.log
 ```
 
 ## Plotting Training Metrics
@@ -194,12 +201,16 @@ This command writes an SVG (`experiment_plots.svg`) plotting the specified varia
 
 - when a ray worker fails, the driver (the process that spawns such worker) shows unrelated errors. It's usually a module not found error in the child worker.
 - Sometimes errors happen and Ray logging handler fails to show the tracebacks, failing silently, debug printing to a file is recommended to enable visibility.
-- when things fail, do ray stop everywhere and restart the process on all nodes. Ray becomes a bit unstable when restarting processes.
+- when things fail, do ray stop everywhere and restart the process on all nodes. Ray becomes a bit unstable when restarting processes. Also delete the ray temp directory to avoid any issues.
 - It's important to create a separate conda environment for the training process or the worker environments will become corrupted. The python version should be the same as the base environment.
 - `ray list actors | grep ALIVE` can be used to check if all the expected workers are running.
 - make sure you can do enough http connections on your cluster: `ulimit -n 65535`
 - Ray creates a lot of temporary files in the `/tmp` directory. You can clean them up with `rm -rf /tmp/ray`. Also, you need enough space, otherwise use `ray start --temp-dir=/dev/shm/ray` to use the shared memory as a temporary directory.
-
+- When a worker fails, it's better to replicate the environment and run it without ray runtime environment management. For example, if the logprob worker fails do this:
+```bash
+conda create -n grpo_logprob python=3.12 -y; conda activate grpo_logprob; pip install -r requirements_base.txt;pip install -r requirements_fsdp.txt
+torchrun --nproc_per_node=1 logprob_worker.py --model_path Qwen/Qwen2-1.5B-Instruct 2>&1 | tee logprob_worker_1.log
+```
 
 ## Customization
 
